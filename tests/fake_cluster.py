@@ -23,6 +23,8 @@ class FakeBackend:
         self.down = False  # every call fails, like an SSH outage
         self.submit_fails: list[bool] = []  # per submit: True = sbatch errors; queued up front
         self.ghost = False  # a failing sbatch still creates the job
+        self.nameless: dict[str, list[tuple[str, str]]] = {}  # jobs Slurm lost the name of, by job ID
+        self.polled_with: list[str | None] = []
 
     def _check(self) -> None:
         if self.down:
@@ -48,9 +50,10 @@ class FakeBackend:
             raise ClusterError("sbatch: error: Batch job submission failed: Unexpected message received")
         return job_id
 
-    async def poll(self, batch_id: str) -> PollResult:
+    async def poll(self, batch_id: str, job_id: str | None = None) -> PollResult:
         self._check()
-        jobs = sorted(self.jobs.get(batch_id, []), key=lambda j: int(j[0]))
+        self.polled_with.append(job_id)
+        jobs = sorted(self.jobs.get(batch_id, []) + self.nameless.get(job_id, []), key=lambda j: int(j[0]))
         return PollResult(jobs, [dict(r) for r in self.progress.get(batch_id, [])])
 
     async def fetch(self, batch_id: str, dest: Path) -> None:

@@ -80,16 +80,18 @@ async def deploy_styles(config: Config, backend: SlurmBackend) -> None:
             civitai = source.startswith("civitai:")
             if civitai and not config.civitai_token:
                 raise SystemExit(f"style {style.name}: [downloads] civitai_token is needed for {source}")
-            header = f"Authorization: Bearer {config.civitai_token}\n".encode() if civitai else b""
+            # curl -K - reads options from stdin. (-H @- would too, but the transfer
+            # node's curl 7.29 silently ignores it and sends no header.)
+            options = f'header = "Authorization: Bearer {config.civitai_token}"\n'.encode() if civitai else b""
             script = (
                 f"if [ -f {target} ] && echo {sha}' '{target} | sha256sum -c --status; then echo present; exit 0; fi; "
-                f"mkdir -p {q(loras)} && curl -fsSL --retry 3 {'-H @-' if civitai else ''} -o {target}.tmp "
+                f"mkdir -p {q(loras)} && curl -fsSL --retry 3 {'-K -' if civitai else ''} -o {target}.tmp "
                 f"{q(download_url(source))} && actual=$(sha256sum {target}.tmp | cut -c1-64) && "
                 f'if [ "$actual" = {sha} ]; then mv {target}.tmp {target}; echo downloaded; '
                 f'else rm -f {target}.tmp; echo "sha256 mismatch: got $actual" >&2; exit 3; fi'
             )
             try:
-                result = await backend._xfer(script, stdin=header, timeout=3600)
+                result = await backend._xfer(script, stdin=options, timeout=3600)
             except ClusterError as exc:
                 raise SystemExit(f"style {style.name}: {source}: {exc}") from None
             print(f"style {style.name}: {name} {result.strip()}")

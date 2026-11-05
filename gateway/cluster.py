@@ -41,7 +41,7 @@ class ClusterBackend(Protocol):
     async def ping(self) -> None: ...
     async def upload_batch(self, batch_id: str, payload: dict) -> None: ...
     async def submit(self, batch_id: str, n_images: int) -> str: ...
-    async def poll(self, batch_id: str) -> PollResult: ...
+    async def poll(self, batch_id: str, job_id: str | None = None) -> PollResult: ...
     async def fetch(self, batch_id: str, dest: Path) -> None: ...
     async def cleanup(self, batch_id: str) -> None: ...
 
@@ -56,12 +56,12 @@ def time_limit_minutes(n_images: int) -> int:
 
 
 def parse_sacct(text: str) -> list[tuple[str, str]]:
-    jobs = []
+    jobs = {}
     for line in text.splitlines():
         job_id, _, state = line.strip().partition("|")
         if job_id.isdigit() and state:
-            jobs.append((job_id, state.split()[0]))  # "CANCELLED by 123" -> CANCELLED
-    return sorted(jobs, key=lambda j: int(j[0]))
+            jobs[job_id] = state.split()[0]  # "CANCELLED by 123" -> CANCELLED; a job listed twice counts once
+    return sorted(jobs.items(), key=lambda j: int(j[0]))
 
 
 def parse_progress(text: str) -> list[dict]:
@@ -136,11 +136,17 @@ class SlurmBackend:
             raise ClusterError(f"unexpected sbatch output: {out.strip()[:200]}")
         return job_id
 
-    async def poll(self, batch_id: str) -> PollResult:
+    async def poll(self, batch_id: str, job_id: str | None = None) -> PollResult:
+        """Jobs found by the batch's name, plus the known job ID.
+
+        The name finds duplicate submissions; the ID still finds the job if Slurm
+        loses its name (seen after a failed scontrol call).
+        """
         name = shlex.quote(batch_id)
         user = shlex.quote(self.c.user)
+        by_id = f" sacct -n -X -P -j {shlex.quote(job_id)} -o JobID,State;" if job_id else ""
         out = await self._login(
-            f"sacct -n -X -P -u {user} -S now-7days --name={name} -o JobID,State;"
+            f"sacct -n -X -P -u {user} -S now-7days --name={name} -o JobID,State;{by_id}"
             f" echo {_SPLIT}; cat {self._path('out', batch_id, 'progress.jsonl')} 2>/dev/null || true"
         )
         jobs_text, _, progress_text = out.partition(_SPLIT)

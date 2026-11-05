@@ -31,16 +31,15 @@ civitai_token = ""            # Civitai API key; only `deploy` uses it, to downl
 
 # LoRA styles. A task picks one with "style": "<name>". `deploy` downloads each file
 # once into ~/sd_service/loras/ and checks its SHA-256 (Civitai's model page and
-# Hugging Face's file page both show it). Example (Hugging Face, with learned tokens):
+# Hugging Face's file page both show it). Example:
 #
 # [[styles]]
-# name = "icon3d"
-# source = "hf:linoyts/3d-icon-sdxl-lora/pytorch_lora_weights.safetensors"
-# sha256 = "4623a4b46c6335dfcf7b282922c879adf3d45ab5197de5bd79ba9efeb8fc74b5"
-# trigger = "3d icon in the style of <s0><s1>"   # added in front of the prompt
-# scale = 1.0                                     # LoRA strength, 0-2
-# embeddings = "hf:linoyts/3d-icon-sdxl-lora/embeddings.safetensors"
-# embeddings_sha256 = "8707994599a5702845dde85d517d54cde8b10b0d35824590ea49bbe84200642a"
-# embedding_tokens = ["<s0>", "<s1>"]
+# name = "pixel"
+# source = "hf:nerijs/pixel-art-xl/pixel-art-xl.safetensors"   # or "civitai:<model version id>"
+# sha256 = "4234637cb80c998f41e348e6a6cb6bc20d8d038b2b0f256b6129b3b5e353eef7"
+# trigger = "pixel art"        # added in front of the prompt
+# scale = 1.0                  # LoRA strength, 0-2
 #
-# A Civitai LoRA uses source = "civitai:<model version id>" and needs civitai_token.
+# A Civitai LoRA (source = "civitai:<id>") needs civitai_token above. A LoRA trained
+# with pivotal tuning also needs embeddings, embeddings_sha256 and embedding_tokens
+# (see DESIGN.md 7.1).

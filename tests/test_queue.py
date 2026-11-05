@@ -237,3 +237,16 @@ def test_restart_resumes_the_in_flight_batch(service, config, backend, clock):
     run(restarted.poller_tick())
     assert {restarted.db.get_task(t).result for t in "ab"} == {"success"}
     assert backend.submits == [batch.batch_id]
+
+
+def test_job_that_lost_its_name_is_still_found_by_id(service, backend):
+    tune(service, max_wait_s=0)
+    add(service, "a")
+    batch = run(service.batcher_tick())
+    job_id = backend.jobs[batch.batch_id][0][0]
+    backend.jobs[batch.batch_id] = []           # sacct --name no longer finds it
+    backend.nameless[job_id] = [(job_id, "FAILED")]
+    run(service.poller_tick())
+    assert backend.polled_with[-1] == job_id
+    assert service.db.in_flight() == []
+    assert service.db.get_task("a").result == "queued"  # requeued, not stuck

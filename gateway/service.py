@@ -218,7 +218,7 @@ class Service:
                     log.warning("batch %s: poll failed: %s", batch.batch_id, exc)
 
     async def _poll_batch(self, batch: Batch) -> None:
-        result = await self.backend.poll(batch.batch_id)
+        result = await self.backend.poll(batch.batch_id, batch.job_id)
         worker = result.worker
         if batch.state == "submitting":
             if worker is not None:

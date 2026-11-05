@@ -85,16 +85,35 @@ def save_webp(image, path: Path) -> None:
     os.replace(tmp, path)
 
 
+LORA_PARTS = ("unet", "text_encoder", "text_encoder_2")
+
+
+def fix_prefixes(state_dict: dict) -> dict:
+    """Collapse doubled part prefixes, e.g. "unet.unet.down_blocks..." to "unet.down_blocks...".
+
+    Some older SDXL LoRA training scripts saved keys that way; diffusers strips one
+    "unet." and then finds no matching layers.
+    """
+    fixed = {}
+    for key, value in state_dict.items():
+        for part in LORA_PARTS:
+            if key.startswith(f"{part}.{part}."):
+                key = key[len(part) + 1:]
+                break
+        fixed[key] = value
+    return fixed
+
+
 def load_style(pipe, name: str, style: dict, loras: Path) -> None:
     """A LoRA, plus its learned embedding tokens if it has any (pivotal tuning).
 
     Embeddings are expected in the diffusers SDXL format: a safetensors file with
     "clip_l" and "clip_g" tensors, one per text encoder.
     """
-    pipe.load_lora_weights(str(loras / style["lora"]), adapter_name=name)
-    if style.get("embeddings"):
-        from safetensors.torch import load_file
+    from safetensors.torch import load_file
 
+    pipe.load_lora_weights(fix_prefixes(load_file(str(loras / style["lora"]))), adapter_name=name)
+    if style.get("embeddings"):
         emb = load_file(str(loras / style["embeddings"]))
         pipe.load_textual_inversion(emb["clip_l"], token=style["tokens"],
                                     text_encoder=pipe.text_encoder, tokenizer=pipe.tokenizer)
@@ -131,9 +150,15 @@ def main() -> int:
     # Load only the styles this batch's remaining tasks use, once; tasks switch between them.
     styles = batch.get("styles", {})
     in_use = sorted({t["style"] for t in todo if t.get("style")})
+    broken: dict[str, str] = {}  # a style that fails to load fails only its own tasks
     for name in in_use:
-        load_style(pipe, name, styles[name], args.loras)
-        stamp(f"style {name} loaded")
+        try:
+            load_style(pipe, name, styles[name], args.loras)
+            stamp(f"style {name} loaded")
+        except Exception as exc:
+            broken[name] = f"style {name} failed to load: {type(exc).__name__}: {exc}"[:500]
+            stamp(broken[name][:200])
+    in_use = [n for n in in_use if n not in broken]
 
     def generate(prompt: str, negative: str, seeds: list[int]):
         return pipe(
@@ -148,6 +173,10 @@ def main() -> int:
 
     for task in todo:
         t = time.monotonic()
+        if task.get("style") in broken:
+            append_line(progress, {"taskid": task["taskid"], "version": task["version"],
+                                   "error": broken[task["style"]], "ts": now()})
+            continue
         if in_use:
             if task.get("style"):
                 pipe.enable_lora()

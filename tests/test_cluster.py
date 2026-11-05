@@ -22,7 +22,7 @@ def recording(config):
 
 
 def test_parse_sacct_sorts_by_job_id_and_cleans_states():
-    text = "1500|COMPLETED\n1499|CANCELLED by 12345\n\njunk\n"
+    text = "1500|COMPLETED\n1499|CANCELLED by 12345\n\njunk\n1500|COMPLETED\n"  # by name, then by ID
     assert parse_sacct(text) == [("1499", "CANCELLED"), ("1500", "COMPLETED")]
 
 

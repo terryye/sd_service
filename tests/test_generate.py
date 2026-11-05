@@ -59,8 +59,10 @@ def generate(monkeypatch):
         def to(self, device):
             return self
 
-        def load_lora_weights(self, path, adapter_name):
-            lora.append(("load", Path(path).name, adapter_name))
+        def load_lora_weights(self, state_dict, adapter_name):
+            if "broken" in adapter_name:
+                raise ValueError("Target modules not found in the base model")
+            lora.append(("load", sorted(state_dict), adapter_name))
 
         def load_textual_inversion(self, tensor, token, text_encoder, tokenizer):
             lora.append(("embed", tensor, tuple(token), text_encoder))
@@ -89,7 +91,9 @@ def generate(monkeypatch):
     diffusers.AutoencoderKL = types.SimpleNamespace(from_pretrained=lambda *a, **k: object())
     diffusers.StableDiffusionXLPipeline = types.SimpleNamespace(from_pretrained=lambda *a, **k: Pipe())
     safetensors_torch = types.ModuleType("safetensors.torch")
-    safetensors_torch.load_file = lambda path: {"clip_l": "L", "clip_g": "G"}
+    safetensors_torch.load_file = lambda path: (
+        {"clip_l": "L", "clip_g": "G"} if path.endswith(".emb.safetensors")
+        else {"unet.unet.down.lora.weight": 1, "text_encoder.layer.lora.weight": 2})
     monkeypatch.setitem(sys.modules, "safetensors.torch", safetensors_torch)
     monkeypatch.setitem(sys.modules, "torch", torch)
     monkeypatch.setitem(sys.modules, "diffusers", diffusers)
@@ -171,7 +175,7 @@ def test_styles_load_once_and_switch_per_task(generate, tmp_path, monkeypatch, c
              {**TASK, "taskid": "plain", "count": 1, "seeds": [2], "style": None}]
     run_batch(generate, tmp_path, monkeypatch, tasks, styles)
     assert generate.lora == [
-        ("load", "icon3d-aaa.safetensors", "icon3d"),
+        ("load", ["text_encoder.layer.lora.weight", "unet.down.lora.weight"], "icon3d"),  # prefix fixed
         ("embed", "L", ("<s0>", "<s1>"), "clip_l side"),
         ("embed", "G", ("<s0>", "<s1>"), "clip_g side"),
         ("enable",), ("set", ("icon3d",), (0.9,)),   # task "styled"
@@ -183,3 +187,19 @@ def test_styles_load_once_and_switch_per_task(generate, tmp_path, monkeypatch, c
 def test_no_styles_means_no_lora_calls(generate, tmp_path, monkeypatch):
     run_batch(generate, tmp_path, monkeypatch, [TASK])
     assert generate.lora == []
+
+
+def test_a_style_that_fails_to_load_fails_only_its_tasks(generate, tmp_path, monkeypatch):
+    styles = {"broken": {"lora": "broken.safetensors", "scale": 1.0, "embeddings": None, "tokens": []}}
+    tasks = [{**TASK, "taskid": "styled", "count": 1, "seeds": [1], "style": "broken"},
+             {**TASK, "taskid": "plain", "count": 1, "seeds": [2], "style": None}]
+    out, progress = run_batch(generate, tmp_path, monkeypatch, tasks, styles)
+    by_task = {r["taskid"]: r for r in progress}
+    assert by_task["styled"]["error"].startswith("style broken failed to load: ValueError")
+    assert by_task["plain"]["images"][0]["result"] == "success"
+    assert (out / "plain" / "v2" / "app_1.webp").exists()
+
+
+def test_fix_prefixes(generate):
+    fixed = generate.fix_prefixes({"unet.unet.a": 1, "unet.b": 2, "text_encoder_2.text_encoder_2.c": 3})
+    assert fixed == {"unet.a": 1, "unet.b": 2, "text_encoder_2.c": 3}
