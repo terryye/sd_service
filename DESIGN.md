@@ -57,7 +57,7 @@ This is an internal service. Only the dictionary app's backend calls it, and app
 | `on_duplicate` | no | `reject` | `reject` or `replace` (section 4.2) |
 | `postprocess` | no | `sticker` | `sticker` (white background + pattern retry) or `none` |
 | `seed` | no | random | seed for image 1; images 2..N derive their seeds from it. Similar, not identical, results across GPU types (see 12) |
-| `style` | no | none | a LoRA style configured in `config.toml` (7.1); its trigger words are added in front of the prompt |
+| `style` | no | none | a LoRA style configured in `config.toml` (7.1); its trigger words are added in front of the prompt unless the prompt already contains them |
 
 **Response:** `202`, with one entry per task, in request order. Each task is accepted or rejected on its own:
 
@@ -115,6 +115,17 @@ At most 100 ids per call; more gives a `400`. Entries come back in the order req
 
 `styles` lists the configured style names. `status` is `degraded` when the cluster has been unreachable for more than 5 minutes, or when free disk falls below a configured threshold.
 
+### 3.4a Styles
+
+`GET /api/styles`
+
+```json
+{"styles": [{"name": "vector", "trigger": "color icon", "scale": 0.8,
+             "hint": "keep prompts short and simple"}]}
+```
+
+The configured LoRA styles (7.1): what a task can pass as `style`, the trigger words added to its prompt, and how to prompt it.
+
 ### 3.5 Result files
 
 `GET /results/{taskid}/{prefix}_{n}.webp?v={version}`
@@ -127,7 +138,7 @@ At most 100 ids per call; more gives a `400`. Entries come back in the order req
 
 `GET /` serves a single static HTML page for trying the service by hand. It's plain HTML and JavaScript with no build step, served by the gateway itself, so it calls the API on the same origin.
 
-- **Form:** a prompt box; `count` (1-4); an optional `filename_prefix`; a style (from `GET /api/health`); `postprocess` (sticker or none); and `on_duplicate`. The taskid is filled in as `test-<timestamp>` and can be edited. Submit sends `POST /api/images/gen` and shows the per-task answer, queued or the rejection reason.
+- **Form:** a prompt box; `count` (1-4); an optional `filename_prefix`; a style (from `GET /api/styles`); `postprocess` (sticker or none); and `on_duplicate`. Picking a style puts its trigger words at the start of the prompt box, replacing the previous style's, and shows its strength and prompting tip. The trigger can be moved anywhere in the prompt. The taskid is filled in as `test-<timestamp>` and can be edited. Submit sends `POST /api/images/gen` and shows the per-task answer, queued or the rejection reason.
 - **Task list:** every task submitted from this browser, newest first. The list of taskids is kept in the browser's `localStorage`, so it survives a page reload. It refreshes every 5 seconds with one bulk status call, and stops refreshing once every task has finished.
 - **Each row:** taskid, prompt, a status badge (`queued`, `running`, `success`, `needs_review`, `failed`), and the time since submission. A failed task shows its `error`.
 - **Preview:** once a task is done, its candidates show as thumbnails, each marked `success` or `needs_review`. Clicking one opens the full 1024×1024 image.
@@ -287,10 +298,11 @@ scale = 1.0                                           # LoRA strength, 0-2
 embeddings = "hf:linoyts/3d-icon-sdxl-lora/embeddings.safetensors"         # optional, pivotal tuning
 embeddings_sha256 = "87079945..."
 embedding_tokens = ["<s0>", "<s1>"]
+hint = "one simple subject"                           # optional: how to prompt it, shown by GET /api/styles
 ```
 
 - **Download:** `deploy` fetches each file on the transfer node into `~/sd_service/loras/`, checks its SHA-256, and skips files already there. Civitai downloads use `[downloads] civitai_token`, sent over ssh's stdin so it never appears on a command line on the cluster.
-- **Trigger words** are part of the prompt the model reads, so the 77-token limit counts them. The gateway's tokenizer knows each style's embedding tokens, so `<s0>` counts as one token, as it does in the job.
+- **Trigger words** are added in front of the prompt, unless the prompt already contains them (case-insensitive), so a client can place them itself; some LoRA creators recommend putting them at the end. They are part of the prompt the model reads, so the 77-token limit counts them. The gateway's tokenizer knows each style's embedding tokens, so `<s0>` counts as one token, as it does in the job.
 - **In the job:** only the styles the batch uses are loaded, once, after the model; each task then switches the active LoRA (or turns LoRAs off for a plain task). Embeddings must be in the diffusers SDXL format: one safetensors file with `clip_l` and `clip_g` tensors.
 - **Removing a style** from the config fails its still-queued tasks with `style '<name>' is no longer configured`.
 - **Licenses** differ per LoRA (some require crediting the creator); check each one before using it in the app.

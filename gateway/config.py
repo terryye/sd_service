@@ -23,6 +23,7 @@ class Style:
     embeddings: str = ""  # optional textual-inversion file, same source forms
     embeddings_sha256: str = ""
     embedding_tokens: tuple[str, ...] = ()
+    hint: str = ""  # how to prompt this style; shown on the test page
 
     def __post_init__(self) -> None:
         if not NAME.fullmatch(self.name):
@@ -49,7 +50,10 @@ class Style:
         return f"{self.name}-{self.embeddings_sha256.lower()[:12]}.emb.safetensors" if self.embeddings else ""
 
     def full_prompt(self, prompt: str) -> str:
-        return f"{self.trigger}, {prompt}" if self.trigger else prompt
+        """The prompt the model reads: the trigger in front, unless the client already placed it."""
+        if not self.trigger or self.trigger.lower() in prompt.lower():
+            return prompt
+        return f"{self.trigger}, {prompt}"
 
 
 def download_url(source: str) -> str:
@@ -134,7 +138,8 @@ _SECTIONS = {
     "limits": {"max_tasks_per_request", "max_ids_per_status", "min_disk_free_gb", "max_prompt_tokens"},
     "downloads": {"civitai_token"},
 }
-_STYLE_KEYS = {"name", "source", "sha256", "trigger", "scale", "embeddings", "embeddings_sha256", "embedding_tokens"}
+_STYLE_KEYS = {"name", "source", "sha256", "trigger", "scale", "embeddings", "embeddings_sha256", "embedding_tokens",
+               "hint"}
 
 
 def load(path: Path) -> Config:

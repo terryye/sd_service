@@ -79,3 +79,22 @@ def test_style_config_parsing_and_checks(tmp_path):
     with pytest.raises(ValueError, match="embedding_tokens"):
         Style(name="x", source="civitai:1", sha256=VECTOR.sha256,
               embeddings="civitai:2", embeddings_sha256=VECTOR.sha256)
+
+
+def test_trigger_is_not_added_twice(styled, backend):
+    # A client that already placed the trigger (anywhere, any case) keeps its prompt as written.
+    styled.submit([{"taskid": "a", "prompt": "a red apple, Color Icon", "style": "vector"},
+                   {"taskid": "b", "prompt": "a red apple", "style": "vector"}])
+    batch = run(styled.batcher_tick())
+    prompts = {t["taskid"]: t["prompt"] for t in backend.uploads[batch.batch_id]["tasks"]}
+    assert prompts == {"a": "a red apple, Color Icon", "b": "color icon, a red apple"}
+
+
+def test_styles_endpoint_lists_triggers_and_hints(client, service):
+    hinted = Style(name="pixel", source="hf:nerijs/pixel-art-xl/pixel-art-xl.safetensors",
+                   sha256="4234637cb80c998f41e348e6a6cb6bc20d8d038b2b0f256b6129b3b5e353eef7",
+                   trigger="pixel art", hint="one simple subject")
+    tune(service, styles={"pixel": hinted, "vector": VECTOR})
+    assert client.get("/api/styles").json() == {"styles": [
+        {"name": "pixel", "trigger": "pixel art", "scale": 1.0, "hint": "one simple subject"},
+        {"name": "vector", "trigger": "color icon", "scale": 1.0, "hint": ""}]}

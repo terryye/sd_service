@@ -60,6 +60,7 @@
                border: 1px solid var(--line); border-radius: 8px; display: block; }
   .thumb span { display: block; margin-top: 4px; }
   .empty { color: var(--muted); }
+  .hint { margin: -4px 0 0; font-size: 13px; color: var(--muted); min-height: 1em; }
   @media (max-width: 640px) { form { grid-template-columns: 1fr 1fr; } }
 </style>
 </head>
@@ -82,6 +83,7 @@
     <label>Style (LoRA)
       <select id="style"><option value="">none (plain SDXL)</option></select>
     </label>
+    <p id="style-hint" class="hint wide"></p>
     <label>Postprocess
       <select id="postprocess"><option value="sticker">sticker</option><option value="none">none</option></select>
     </label>
@@ -143,7 +145,7 @@ async function refreshHealth() {
   const box = $("health");
   try {
     const h = await api("/api/health");
-    fillStyles(h.styles || []);
+    if ((h.styles || []).join() !== Object.keys(styles).sort().join()) loadStyles();
     const pills = [
       ["status", h.status, h.status !== "ok"],
       ["cluster", h.cluster, h.cluster === "unreachable"],
@@ -162,14 +164,46 @@ async function refreshHealth() {
   }
 }
 
-function fillStyles(names) {
-  const sel = $("style");
-  const have = [...sel.options].slice(1).map((o) => o.value);
-  if (have.join() === names.join()) return;
-  const keep = sel.value;
-  sel.replaceChildren(sel.options[0], ...names.map((n) => { const o = el("option", null, n); o.value = n; return o; }));
-  sel.value = names.includes(keep) ? keep : "";
+let styles = {};           // name -> {trigger, scale, hint}, from /api/styles
+
+async function loadStyles() {
+  try {
+    const body = await api("/api/styles");
+    styles = Object.fromEntries(body.styles.map((st) => [st.name, st]));
+  } catch { return; }
+  const sel = $("style"), keep = sel.value;
+  sel.replaceChildren(sel.options[0], ...Object.keys(styles).map((n) => {
+    const o = el("option", null, `${n} (${styles[n].trigger || "no trigger"})`); o.value = n; return o;
+  }));
+  sel.value = styles[keep] ? keep : "";
+  showHint();
 }
+
+function showHint() {
+  const st = styles[$("style").value];
+  $("style-hint").textContent = st
+    ? `Trigger "${st.trigger}" is in the prompt (move it if you like; the gateway adds it if missing). ` +
+      `Strength ${st.scale}.${st.hint ? " Tip: " + st.hint : ""}`
+    : "";
+}
+
+// Picking a style swaps its trigger into the prompt, replacing the previous style's.
+let lastStyle = "";
+function onStyleChange() {
+  const box = $("prompt");
+  let text = box.value;
+  const old = styles[lastStyle]?.trigger;
+  if (old) {
+    const i = text.toLowerCase().indexOf(old.toLowerCase());
+    if (i >= 0) text = (text.slice(0, i) + text.slice(i + old.length)).replace(/^[\s,]+|[\s,]+$/g, "").replace(/,\s*,/g, ",");
+  }
+  lastStyle = $("style").value;
+  const trig = styles[lastStyle]?.trigger;
+  if (trig && !text.toLowerCase().includes(trig.toLowerCase())) text = text ? `${trig}, ${text}` : trig;
+  box.value = text;
+  showHint();
+}
+$("style").addEventListener("change", onStyleChange);
 
 async function refreshTasks() {
   const pending = tasks.filter((t) => !FINISHED.has(status[t.taskid]?.result)).map((t) => t.taskid);
@@ -264,6 +298,7 @@ $("clear").addEventListener("click", () => {
 });
 
 $("taskid").value = newTaskId();
+loadStyles();
 render();
 refreshTasks();
 refreshHealth();

@@ -16,6 +16,7 @@ The gateway runs outside the cluster: it queues tasks in SQLite, batches them in
 | `GET /api/images/tasks/{taskid}` | status and image URLs of one task |
 | `GET /api/images/tasks?ids=a,b,c` | bulk status |
 | `GET /api/health` | cluster reachability, queue length, free disk |
+| `GET /api/styles` | the configured LoRA styles, with trigger words and prompting tips |
 | `GET /results/{taskid}/{prefix}_{n}.webp` | an image |
 | `GET /` | test page: submit a prompt, watch the status, preview the images |
 

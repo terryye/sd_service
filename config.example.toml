@@ -34,11 +34,12 @@ civitai_token = ""            # Civitai API key; only `deploy` uses it, to downl
 # Hugging Face's file page both show it). Example:
 #
 # [[styles]]
-# name = "pixel"
-# source = "hf:nerijs/pixel-art-xl/pixel-art-xl.safetensors"   # or "civitai:<model version id>"
-# sha256 = "4234637cb80c998f41e348e6a6cb6bc20d8d038b2b0f256b6129b3b5e353eef7"
-# trigger = "pixel art"        # added in front of the prompt
-# scale = 1.0                  # LoRA strength, 0-2
+# name = "vector"              # https://civitai.com/models/60132 (SDXL version)
+# source = "civitai:1219697"   # Civitai model version id, or "hf:<owner>/<repo>/<file>.safetensors"
+# sha256 = "b0024ab16d212bb1f08ccbc3b25cbe781e3aef8b00f91526778ca1b1a2c61480"
+# trigger = "color icon"       # added in front of the prompt unless it already contains it
+# scale = 0.8                  # LoRA strength, 0-2
+# hint = 'keep prompts short and simple'   # optional, shown on the test page
 #
 # A Civitai LoRA (source = "civitai:<id>") needs civitai_token above. A LoRA trained
 # with pivotal tuning also needs embeddings, embeddings_sha256 and embedding_tokens

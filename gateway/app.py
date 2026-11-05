@@ -82,6 +82,11 @@ def create_app(service: Service, run_loops: bool = True) -> FastAPI:
     async def health():
         return service.health()
 
+    @app.get("/api/styles")
+    async def styles():
+        return {"styles": [{"name": s.name, "trigger": s.trigger, "scale": s.scale, "hint": s.hint}
+                           for s in sorted(service.c.styles.values(), key=lambda s: s.name)]}
+
     @app.get("/", include_in_schema=False)
     async def test_page():
         return FileResponse(STATIC / "index.html")
