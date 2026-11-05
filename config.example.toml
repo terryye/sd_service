@@ -1,0 +1,46 @@
+# Copy to config.toml and edit. See DESIGN.md section 9.
+
+[server]
+listen = "127.0.0.1:8080"     # a private address on the deploy server
+data_dir = "./data"           # SQLite file and result images; back this up
+
+[cluster]
+user = "your.username"
+login_host = "login.explorer.northeastern.edu"
+xfer_host = "xfer.discovery.neu.edu"
+ssh_key = ""                  # e.g. "~/.ssh/sd_gateway"; empty uses ssh's default key
+remote_dir = "~/sd_service"   # shared container and model live here
+env = "dev"                   # "prod" on the server: ~/sd_service/<env>/ and sdg-<env>- job names
+
+[queue]
+max_batch_images = 200
+max_wait_s = 60
+max_attempts = 3
+
+[poll]
+interval_s = 30
+unreachable_after_s = 300
+
+[limits]
+max_tasks_per_request = 100
+max_ids_per_status = 100
+min_disk_free_gb = 10
+
+[downloads]
+civitai_token = ""            # Civitai API key; only `deploy` uses it, to download Civitai LoRAs
+
+# LoRA styles. A task picks one with "style": "<name>". `deploy` downloads each file
+# once into ~/sd_service/loras/ and checks its SHA-256 (Civitai's model page and
+# Hugging Face's file page both show it). Example (Hugging Face, with learned tokens):
+#
+# [[styles]]
+# name = "icon3d"
+# source = "hf:linoyts/3d-icon-sdxl-lora/pytorch_lora_weights.safetensors"
+# sha256 = "4623a4b46c6335dfcf7b282922c879adf3d45ab5197de5bd79ba9efeb8fc74b5"
+# trigger = "3d icon in the style of <s0><s1>"   # added in front of the prompt
+# scale = 1.0                                     # LoRA strength, 0-2
+# embeddings = "hf:linoyts/3d-icon-sdxl-lora/embeddings.safetensors"
+# embeddings_sha256 = "8707994599a5702845dde85d517d54cde8b10b0d35824590ea49bbe84200642a"
+# embedding_tokens = ["<s0>", "<s1>"]
+#
+# A Civitai LoRA uses source = "civitai:<model version id>" and needs civitai_token.

@@ -1,0 +1,25 @@
+[project]
+name = "sd-service-gateway"
+version = "0.1.0"
+description = "HTTP gateway that runs SDXL illustration batches on Northeastern's Explorer HPC"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "pillow>=10.0",
+    "tokenizers>=0.19",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "httpx>=0.27"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = [".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]

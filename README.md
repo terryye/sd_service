@@ -2,22 +2,13 @@
 
 An internal image generation service for a kids' dictionary app. The app's backend submits prompts over HTTP; the service generates sticker-style illustrations (one subject, pure white background, 1024×1024 WebP) with SDXL on GPUs of Northeastern's Explorer HPC cluster, and serves the results.
 
-## Status
-
-| Part | State |
-|---|---|
-| Image pipeline on Explorer (`generate.py`, `postprocess.py`, `sd_job.sh`) | working, tested on the cluster |
-| HTTP gateway (API, SQLite queue, batcher, poller, test page) | designed in [DESIGN.md](DESIGN.md), not built yet |
-
-## How it works
-
 ```
 app backend ──HTTP──> gateway ──SSH, rsync──> Explorer: Slurm GPU job (SDXL)
 ```
 
-The gateway runs outside the cluster: it queues tasks in SQLite, batches them into Slurm GPU jobs (up to 200 images, or after 60 s), polls the job every 30 s, and serves the finished images. All connections start at the gateway; the cluster never calls back.
+The gateway runs outside the cluster: it queues tasks in SQLite, batches them into Slurm GPU jobs (up to 200 images, or after 60 s), polls the job every 30 s, and serves the finished images. All connections start at the gateway; the cluster never calls back. [DESIGN.md](DESIGN.md) has the full design.
 
-## API (planned)
+## API
 
 | Endpoint | Purpose |
 |---|---|
@@ -28,23 +19,38 @@ The gateway runs outside the cluster: it queues tasks in SQLite, batches them in
 | `GET /results/{taskid}/{prefix}_{n}.webp` | an image |
 | `GET /` | test page: submit a prompt, watch the status, preview the images |
 
-A task is one prompt with 1 to 4 candidate images:
+A task is one prompt (at most 77 tokens) with 1 to 4 candidate images:
 
-```json
-{"taskid": "apple-01", "prompt": "a shiny red apple, cartoon sticker",
- "filename_prefix": "apple", "count": 4, "on_duplicate": "reject"}
+```bash
+curl -X POST http://127.0.0.1:8080/api/images/gen -H 'Content-Type: application/json' -d '{"tasks": [
+  {"taskid": "apple-01", "prompt": "a cute cartoon sticker of a red apple, single object, white background",
+   "filename_prefix": "apple", "count": 2}]}'
+curl http://127.0.0.1:8080/api/images/tasks/apple-01
 ```
 
-See [DESIGN.md](DESIGN.md) for the full design.
+Optional fields: `on_duplicate` (`reject` or `replace`), `postprocess` (`sticker` or `none`), `seed`, and `style`: a LoRA configured as a `[[styles]]` entry in `config.toml` (see `config.example.toml` and DESIGN.md 7.1). `deploy` downloads and checks each style's files.
+
+## Running it
+
+Requires Python 3.11+, and SSH access to Explorer with a key that works without a password.
+
+```bash
+uv venv --python 3.12 .venv && uv pip install --python .venv -e '.[dev]'
+cp config.example.toml config.toml      # set user, env ("dev" or "prod"), listen address
+.venv/bin/python -m gateway deploy      # copy cluster/ to ~/sd_service/<env>/, pin the container
+.venv/bin/python -m gateway serve       # then open http://127.0.0.1:8080/
+.venv/bin/python -m pytest              # unit tests, no cluster needed
+```
+
+Run `deploy` again whenever `cluster/` changes. Each environment (`dev`, `prod`) has its own folder and job names on the cluster, so they never touch each other. `data/` holds the SQLite file and every image; it is the only copy, so back it up.
 
 ## Files
 
-| File | Runs on | What it does |
-|---|---|---|
-| `generate.py` | cluster | SDXL generation; retries images that come out as repeating patterns |
-| `postprocess.py` | cluster | turns the background white, detects patterns |
-| `sd_job.sh` | cluster (Slurm) | GPU job: installs `diffusers` on node-local `/tmp`, runs `generate.py` |
-| `submit.sh`, `words.csv` | Mac | interim tool to run one batch from a CSV until the gateway exists |
-| `DESIGN.md` | - | gateway design |
+| Path | What it is |
+|---|---|
+| `gateway/` | the HTTP service: API, SQLite queue, batcher, poller, test page |
+| `cluster/` | runs on Explorer: `sd_job.sh` (Slurm job), `generate.py` (SDXL), `postprocess.py` (white background, pattern and cut-off checks) |
+| `tests/` | unit tests with a fake cluster |
+| `DESIGN.md` | the design |
 
-On the cluster, the service lives in `~/sd_service`: code, the SDXL model cache (`hf_cache/`, about 7 GB), job outputs and logs.
+On the cluster, `~/sd_service/` holds the pinned PyTorch container, the SDXL model cache (about 7 GB), and one folder per environment.

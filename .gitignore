@@ -1,7 +1,7 @@
-# Generated output
-images/
-run.log
-
 __pycache__/
 *.pyc
 .venv/
+
+# Local settings and gateway state
+config.toml
+data/

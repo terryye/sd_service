@@ -1,6 +1,6 @@
 # Image Generation Gateway: Design
 
-Status: draft for review. Last updated 2026-11-05.
+Status: implemented (gateway/, cluster/). Last updated 2026-11-05.
 
 ## 1. Purpose
 
@@ -57,6 +57,7 @@ This is an internal service. Only the dictionary app's backend calls it, and app
 | `on_duplicate` | no | `reject` | `reject` or `replace` (section 4.2) |
 | `postprocess` | no | `sticker` | `sticker` (white background + pattern retry) or `none` |
 | `seed` | no | random | seed for image 1; images 2..N derive their seeds from it. Similar, not identical, results across GPU types (see 12) |
+| `style` | no | none | a LoRA style configured in `config.toml` (7.1); its trigger words are added in front of the prompt |
 
 **Response:** `202`, with one entry per task, in request order. Each task is accepted or rejected on its own:
 
@@ -70,7 +71,7 @@ This is an internal service. Only the dictionary app's backend calls it, and app
 
 - **Whole-request errors:**
   - `400`: malformed JSON, or more than 100 tasks.
-- **Per-task rejections** (`result: "rejected"`): an invalid field, `prompt too long` (over 77 tokens), `taskid exists` (with `on_duplicate: reject`), or `task is running` (a `replace` of a running task).
+- **Per-task rejections** (`result: "rejected"`): an invalid field, an unknown `style`, `prompt too long` (over 77 tokens, counting the style's trigger words), `taskid exists` (with `on_duplicate: reject`), or `task is running` (a `replace` of a running task).
 
 ### 3.2 Status of one task
 
@@ -109,10 +110,10 @@ At most 100 ids per call; more gives a `400`. Entries come back in the order req
 ```json
 {"status": "ok", "cluster": "reachable", "last_poll": "2026-11-05T14:02:30Z",
  "queued_tasks": 12, "queued_images": 40, "oldest_queued_age_s": 45,
- "batches_in_flight": 1, "disk_free_gb": 182.4}
+ "batches_in_flight": 1, "disk_free_gb": 182.4, "styles": ["icon3d"]}
 ```
 
-`status` is `degraded` when the cluster has been unreachable for more than 5 minutes, or when free disk falls below a configured threshold.
+`styles` lists the configured style names. `status` is `degraded` when the cluster has been unreachable for more than 5 minutes, or when free disk falls below a configured threshold.
 
 ### 3.5 Result files
 
@@ -126,7 +127,7 @@ At most 100 ids per call; more gives a `400`. Entries come back in the order req
 
 `GET /` serves a single static HTML page for trying the service by hand. It's plain HTML and JavaScript with no build step, served by the gateway itself, so it calls the API on the same origin.
 
-- **Form:** a prompt box; `count` (1-4); an optional `filename_prefix`; `postprocess` (sticker or none); and `on_duplicate`. The taskid is filled in as `test-<timestamp>` and can be edited. Submit sends `POST /api/images/gen` and shows the per-task answer, queued or the rejection reason.
+- **Form:** a prompt box; `count` (1-4); an optional `filename_prefix`; a style (from `GET /api/health`); `postprocess` (sticker or none); and `on_duplicate`. The taskid is filled in as `test-<timestamp>` and can be edited. Submit sends `POST /api/images/gen` and shows the per-task answer, queued or the rejection reason.
 - **Task list:** every task submitted from this browser, newest first. The list of taskids is kept in the browser's `localStorage`, so it survives a page reload. It refreshes every 5 seconds with one bulk status call, and stops refreshing once every task has finished.
 - **Each row:** taskid, prompt, a status badge (`queued`, `running`, `success`, `needs_review`, `failed`), and the time since submission. A failed task shows its `error`.
 - **Preview:** once a task is done, its candidates show as thumbnails, each marked `success` or `needs_review`. Clicking one opens the full 1024×1024 image.
@@ -145,7 +146,7 @@ queued ──> running ──> success        (at least one image "success")
    └──────────┘  batch ended before this task finished: back to queued (see 6.3)
 ```
 
-Each image has its own `result`: `success` or `needs_review`. `needs_review` means the image still looked like a repeating pattern after 4 tries. The image exists, but a person should look at it before using it.
+Each image has its own `result`: `success` or `needs_review`. `needs_review` means the image still looked like a repeating pattern, or had an object cut off by the edge, after 4 tries. The image exists, but a person should look at it before using it.
 
 ### 4.2 Duplicate taskids (`on_duplicate`)
 
@@ -175,7 +176,7 @@ batches(batch_id TEXT PRIMARY KEY, slurm_job_id TEXT, job_name TEXT, state TEXT,
 ```
 
 **The batcher** checks every 5 seconds. It forms a batch when:
-- **No batch is in flight.** Only one Slurm job runs at a time. A full batch of 200 images takes about 30 minutes, which is plenty for a dictionary.
+- **No batch is in flight.** Only one Slurm job runs at a time. A full batch of 200 images takes about 30 minutes of generation, which is plenty for a dictionary.
 - **And either limit is hit:** the queued tasks add up to 200 images, or the oldest queued task has waited 60 seconds.
 
 How a batch is filled:
@@ -194,9 +195,12 @@ How a batch is filled:
 Paths below are relative to the environment's directory on the cluster, `~/sd_service/<env>/` (see 6.4). The gateway uploads `batches/<batch_id>/batch.json`:
 
 ```json
-{"batch_id": "sdg-prod-000123", "tasks": [
-  {"taskid": "apple-01", "version": 1, "prompt": "...", "count": 4,
-   "seeds": [99812, 31007, 55120, 70411], "postprocess": "sticker", "filename_prefix": "apple"}]}
+{"batch_id": "sdg-prod-000123",
+ "styles": {"icon3d": {"lora": "icon3d-4623a4b46c63.safetensors", "scale": 1.0,
+                       "embeddings": "icon3d-8707994599a5.emb.safetensors", "tokens": ["<s0>", "<s1>"]}},
+ "tasks": [
+  {"taskid": "apple-01", "version": 1, "prompt": "3d icon in the style of <s0><s1>, ...", "style": "icon3d",
+   "count": 4, "seeds": [99812, 31007, 55120, 70411], "postprocess": "sticker", "filename_prefix": "apple"}]}
 ```
 
 The job writes `out/<batch_id>/<taskid>/v<version>/<prefix>_<n>.webp`. After each task it appends one line to `out/<batch_id>/progress.jsonl`:
@@ -206,11 +210,11 @@ The job writes `out/<batch_id>/<taskid>/v<version>/<prefix>_<n>.webp`. After eac
  "images": [{"file": "apple_1.webp", "seed": 99812, "result": "success", "attempts": 1}, ...]}
 ```
 
-Generation is resumable: a re-run skips tasks that already appear in `progress.jsonl`.
+`prompt` is the full prompt the model reads, trigger words included. `styles` holds only the styles this batch's tasks use. Generation is resumable: a re-run skips tasks that already appear in `progress.jsonl`.
 
 ### 6.2 Submitting
 
-- **Slurm settings:** `sbatch --job-name=<batch_id> --dependency=singleton`, on the `gpu` partition with 1 GPU. The time limit is 10 minutes plus 15 seconds per image, capped at 8 hours.
+- **Slurm settings:** `sbatch --job-name=<batch_id> --dependency=singleton`, on the `gpu` partition with 1 GPU. The time limit is 30 minutes plus 15 seconds per image, capped at 8 hours. Start-up alone has taken from under 2 to over 11 minutes depending on the node, and one job with a 10-minute base timed out before generating anything.
 - **Failed submissions:** `sbatch` can report a failure ("Unexpected message received") and still create the job, sometimes minutes later. So the gateway never resubmits blindly:
   - every submission of a batch reuses the same job name;
   - `--dependency=singleton` stops two copies from running at once;
@@ -248,12 +252,13 @@ sacct -n -X -P -u <user> -S now-7days --name=<batch_id> -o JobID,State ; tail pr
 ~/sd_service/
   pytorch.sif        pinned copy of RC's PyTorch container (shared by all environments)
   hf_cache/          SDXL model weights, about 7 GB (shared)
+  loras/             LoRA style files, named <style>-<first 12 hex of sha256> (shared)
   dev/  prod/        one directory per environment: cluster code, batches/, out/, logs/
 ```
 
 - **One directory per environment.** The dev gateway (on the Mac) and the prod gateway (on the server) must not see each other's batches: they would overwrite each other's files, and the "lowest job ID with this name wins" rule would mix their jobs. So each environment has its own directory and its own batch and job-name prefix (`sdg-dev-…`, `sdg-prod-…`), set by `env` in the config. Each also has its own copy of the cluster code, so testing new code in dev never touches prod.
 - **A pinned container.** RC can replace `/shared/container_repository/explorer/pytorch/pytorch_training.sif` at any time (it last changed on Oct 20, 2026), and a new torch or transformers inside it could break the pinned `diffusers`. The service runs from its own copy, `~/sd_service/pytorch.sif` (4.3 GB, one file, so shared storage handles it well). It is refreshed only on purpose, after testing in dev.
-- **Python packages:** `diffusers==0.42.1` and its few missing dependencies are installed into node-local `/tmp` in each job.
+- **Python packages:** `diffusers==0.42.1`, `peft==0.21.2` (for LoRAs) and their few missing dependencies are installed into node-local `/tmp` in each job.
 - **Disk:** the shared files take about 11 GB of the 75 GB home quota. Batch output is temporary and is removed after the gateway pulls it.
 
 ## 7. Image pipeline
@@ -262,11 +267,33 @@ sacct -n -X -P -u <user> -S now-7days --name=<batch_id> -o JobID,State ; tail pr
 - **Prompt length:** SDXL's text encoders read at most 77 tokens and silently ignore the rest. The gateway counts tokens at submit time with SDXL's CLIP tokenizer and rejects longer prompts with `prompt too long`, so a prompt is never cut off without the client knowing.
 - **Negative prompt:** the kids' safety negative prompt is always added to the client's prompt.
 - **`postprocess: sticker`:**
-  - whiten the background: the edge-connected flat background, holes that match it, and stray specks;
-  - check for a repeating pattern, and if found, retry with the next seed, up to 4 tries;
+  - whiten the background: the edge-connected flat background, holes that match it, stray specks, and the light grey haze of a soft shadow around the sticker;
+  - check for a repeating pattern or an object cut off by the image edge, and if found, retry with the next seed, up to 4 tries;
   - if all tries fail, keep the image and mark it `needs_review`.
 - **`postprocess: none`:** the raw SDXL output.
 - **Saving:** all checks run on the full-quality image; the file is saved last, as WebP at quality 90.
+
+### 7.1 Styles (LoRAs)
+
+A style is a LoRA, configured once in `config.toml` and picked per task with `"style": "<name>"`. Adding a LoRA is a config change and a `deploy`, not a code change.
+
+```toml
+[[styles]]
+name = "icon3d"                                       # what tasks ask for
+source = "hf:linoyts/3d-icon-sdxl-lora/pytorch_lora_weights.safetensors"   # or "civitai:<version id>"
+sha256 = "4623a4b4..."                                # required; deploy refuses a file that doesn't match
+trigger = "3d icon in the style of <s0><s1>"          # added in front of the prompt
+scale = 1.0                                           # LoRA strength, 0-2
+embeddings = "hf:linoyts/3d-icon-sdxl-lora/embeddings.safetensors"         # optional, pivotal tuning
+embeddings_sha256 = "87079945..."
+embedding_tokens = ["<s0>", "<s1>"]
+```
+
+- **Download:** `deploy` fetches each file on the transfer node into `~/sd_service/loras/`, checks its SHA-256, and skips files already there. Civitai downloads use `[downloads] civitai_token`, sent over ssh's stdin so it never appears on a command line on the cluster.
+- **Trigger words** are part of the prompt the model reads, so the 77-token limit counts them. The gateway's tokenizer knows each style's embedding tokens, so `<s0>` counts as one token, as it does in the job.
+- **In the job:** only the styles the batch uses are loaded, once, after the model; each task then switches the active LoRA (or turns LoRAs off for a plain task). Embeddings must be in the diffusers SDXL format: one safetensors file with `clip_l` and `clip_g` tensors.
+- **Removing a style** from the config fails its still-queued tasks with `style '<name>' is no longer configured`.
+- **Licenses** differ per LoRA (some require crediting the creator); check each one before using it in the app.
 
 ## 8. Security
 
@@ -290,6 +317,8 @@ One file, `config.toml`, so the same code runs on a laptop and on the server:
 [queue]     max_batch_images = 200   max_wait_s = 60   max_attempts = 3
 [poll]      interval_s = 30   unreachable_after_s = 300
 [limits]    max_tasks_per_request = 100   max_ids_per_status = 100   min_disk_free_gb = 10
+[downloads] civitai_token = ""          # deploy only
+[[styles]]  ...                         # one table per LoRA style, see 7.1
 ```
 
 ## 10. Implementation layout and testing
@@ -298,12 +327,13 @@ One file, `config.toml`, so the same code runs on a laptop and on the server:
 gateway/
   app.py        FastAPI routes (submit, status, bulk status, health, results, test page)
   static/index.html   the test page (3.6)
+  service.py    task validation, the batcher and the poller (heartbeat, collecting, retries)
   db.py         SQLite schema, queue operations, state transitions
-  batcher.py    forms batches, submits them
-  poller.py     heartbeat, collects results, retries
-  cluster.py    ClusterBackend interface: SlurmBackend (SSH) and FakeBackend (tests)
-  config.py
+  cluster.py    ClusterBackend interface and SlurmBackend (SSH, rsync)
+  config.py     config.toml
+  __main__.py   `serve` and `deploy` commands
 cluster/        sd_job.sh, generate.py, postprocess.py (deployed to ~/sd_service/<env>/)
+tests/          FakeBackend (fake_cluster.py) and the unit tests
 ```
 
 - **Stack:** Python 3.12, FastAPI with uvicorn, and the `sqlite3` module from the standard library. The batcher and poller are background tasks in the same process.
