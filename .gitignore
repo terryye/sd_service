@@ -1,0 +1,7 @@
+# Generated output
+images/
+run.log
+
+__pycache__/
+*.pyc
+.venv/
