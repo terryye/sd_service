@@ -51,12 +51,12 @@ This is an internal service. Only the dictionary app's backend calls it, and app
 | Field | Required | Default | Rules |
 |---|---|---|---|
 | `taskid` | yes | - | globally unique; `[A-Za-z0-9_-]`, 1-64 characters |
-| `prompt` | yes | - | 1-1000 characters; the kids' safety negative prompt is always added |
+| `prompt` | yes | - | at most 77 tokens, SDXL's limit (about 50-60 words; see 7); the kids' safety negative prompt is always added |
 | `filename_prefix` | no | the taskid | `[A-Za-z0-9_-]`, 1-64 characters; files are `<prefix>_<n>.webp` |
 | `count` | no | 1 | 1-4 candidate images |
 | `on_duplicate` | no | `reject` | `reject` or `replace` (section 4.2) |
 | `postprocess` | no | `sticker` | `sticker` (white background + pattern retry) or `none` |
-| `seed` | no | random | seed for image 1; images 2..N derive their seeds from it |
+| `seed` | no | random | seed for image 1; images 2..N derive their seeds from it. Similar, not identical, results across GPU types (see 12) |
 
 **Response:** `202`, with one entry per task, in request order. Each task is accepted or rejected on its own:
 
@@ -70,7 +70,7 @@ This is an internal service. Only the dictionary app's backend calls it, and app
 
 - **Whole-request errors:**
   - `400`: malformed JSON, or more than 100 tasks.
-- **Per-task rejections** (`result: "rejected"`): an invalid field, `taskid exists` (with `on_duplicate: reject`), or `task is running` (a `replace` of a running task).
+- **Per-task rejections** (`result: "rejected"`): an invalid field, `prompt too long` (over 77 tokens), `taskid exists` (with `on_duplicate: reject`), or `task is running` (a `replace` of a running task).
 
 ### 3.2 Status of one task
 
@@ -191,15 +191,15 @@ How a batch is filled:
 
 ### 6.1 The contract with the job
 
-The gateway uploads `~/sd_service/batches/<batch_id>/batch.json`:
+Paths below are relative to the environment's directory on the cluster, `~/sd_service/<env>/` (see 6.4). The gateway uploads `batches/<batch_id>/batch.json`:
 
 ```json
-{"batch_id": "b_000123", "tasks": [
+{"batch_id": "sdg-prod-000123", "tasks": [
   {"taskid": "apple-01", "version": 1, "prompt": "...", "count": 4,
    "seeds": [99812, 31007, 55120, 70411], "postprocess": "sticker", "filename_prefix": "apple"}]}
 ```
 
-The job writes `~/sd_service/out/<batch_id>/<taskid>/v<version>/<prefix>_<n>.webp`. After each task it appends one line to `out/<batch_id>/progress.jsonl`:
+The job writes `out/<batch_id>/<taskid>/v<version>/<prefix>_<n>.webp`. After each task it appends one line to `out/<batch_id>/progress.jsonl`:
 
 ```json
 {"taskid": "apple-01", "version": 1, "ts": "...",
@@ -244,15 +244,22 @@ sacct -n -X -P -u <user> -S now-7days --name=<batch_id> -o JobID,State ; tail pr
 
 ### 6.4 Cluster-side environment
 
-This is unchanged from the current `sd_service`:
-- **Container:** RC's PyTorch container, `/shared/container_repository/explorer/pytorch/pytorch_training.sif`.
-- **Python packages:** `diffusers` and the other missing packages are installed into node-local `/tmp` in each job.
-- **Model:** the SDXL weights are cached in `~/sd_service/hf_cache`.
-- **Stored on the cluster:** code and the model live in `~/sd_service`. Output is temporary and is removed after the gateway pulls it.
+```
+~/sd_service/
+  pytorch.sif        pinned copy of RC's PyTorch container (shared by all environments)
+  hf_cache/          SDXL model weights, about 7 GB (shared)
+  dev/  prod/        one directory per environment: cluster code, batches/, out/, logs/
+```
+
+- **One directory per environment.** The dev gateway (on the Mac) and the prod gateway (on the server) must not see each other's batches: they would overwrite each other's files, and the "lowest job ID with this name wins" rule would mix their jobs. So each environment has its own directory and its own batch and job-name prefix (`sdg-dev-…`, `sdg-prod-…`), set by `env` in the config. Each also has its own copy of the cluster code, so testing new code in dev never touches prod.
+- **A pinned container.** RC can replace `/shared/container_repository/explorer/pytorch/pytorch_training.sif` at any time (it last changed on Oct 20, 2026), and a new torch or transformers inside it could break the pinned `diffusers`. The service runs from its own copy, `~/sd_service/pytorch.sif` (4.3 GB, one file, so shared storage handles it well). It is refreshed only on purpose, after testing in dev.
+- **Python packages:** `diffusers==0.42.1` and its few missing dependencies are installed into node-local `/tmp` in each job.
+- **Disk:** the shared files take about 11 GB of the 75 GB home quota. Batch output is temporary and is removed after the gateway pulls it.
 
 ## 7. Image pipeline
 
 - **Model:** SDXL base 1.0 with the fp16-fix VAE, 30 steps, guidance 6.0, always 1024×1024.
+- **Prompt length:** SDXL's text encoders read at most 77 tokens and silently ignore the rest. The gateway counts tokens at submit time with SDXL's CLIP tokenizer and rejects longer prompts with `prompt too long`, so a prompt is never cut off without the client knowing.
 - **Negative prompt:** the kids' safety negative prompt is always added to the client's prompt.
 - **`postprocess: sticker`:**
   - whiten the background: the edge-connected flat background, holes that match it, and stray specks;
@@ -279,6 +286,7 @@ One file, `config.toml`, so the same code runs on a laptop and on the server:
 [server]    listen = "127.0.0.1:8080"   data_dir = "./data"
 [cluster]   user = "ye.te"   login_host = "login.explorer.northeastern.edu"
             xfer_host = "xfer.discovery.neu.edu"   ssh_key = "~/.ssh/sd_gateway"   remote_dir = "~/sd_service"
+            env = "dev"   # "prod" on the server; picks ~/sd_service/<env>/ and the sdg-<env>- prefix
 [queue]     max_batch_images = 200   max_wait_s = 60   max_attempts = 3
 [poll]      interval_s = 30   unreachable_after_s = 300
 [limits]    max_tasks_per_request = 100   max_ids_per_status = 100   min_disk_free_gb = 10
@@ -295,12 +303,13 @@ gateway/
   poller.py     heartbeat, collects results, retries
   cluster.py    ClusterBackend interface: SlurmBackend (SSH) and FakeBackend (tests)
   config.py
-cluster/        sd_job.sh, generate.py, postprocess.py (deployed to ~/sd_service)
+cluster/        sd_job.sh, generate.py, postprocess.py (deployed to ~/sd_service/<env>/)
 ```
 
 - **Stack:** Python 3.12, FastAPI with uvicorn, and the `sqlite3` module from the standard library. The batcher and poller are background tasks in the same process.
 - **Unit tests** use `FakeBackend`, with no GPU or SSH. They cover:
-  - validation and per-task rejection
+  - validation and per-task rejection, including prompts over 77 tokens
+  - dev and prod settings never touch each other's cluster directories or job names
   - duplicate `reject` and `replace` in every state, including rejecting a replace while running
   - batch formation (size and time limits, one batch at a time, first-in-first-out order)
   - collecting results while a batch is running
@@ -319,6 +328,12 @@ cluster/        sd_job.sh, generate.py, postprocess.py (deployed to ~/sd_service
    - back up `data/` (the SQLite file and `results/`). It is the only copy of the images.
 3. Watch `GET /api/health`: cluster reachability, queue age and free disk.
 
-## 12. Open items
+## 12. Notes
+
+- **Seeds are not exactly reproducible across GPU types.** The same prompt and seed on a V100 and on an H200 can give slightly different images. A `seed` gives similar results, not identical files.
+- **Usage counts against the account's fair share.** Every batch lowers the Slurm priority of the account it runs under, including the owner's own coursework jobs. At dictionary scale this is minor, but heavy use makes all of that account's jobs wait longer.
+- **Model license.** SDXL base 1.0 is released under the CreativeML Open RAIL++-M license. It allows using the generated images in an app, but forbids certain uses; the course report, and the app if it is ever published, should mention it.
+
+## 13. Open items
 
 - **RC check:** before going live, confirm with the course instructor or RC (`rchelp@northeastern.edu`) that an automated service using a personal Explorer account for coursework is acceptable.
