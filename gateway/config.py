@@ -12,6 +12,27 @@ SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
 @dataclass(frozen=True)
+class Engine:
+    """An image model a task can run on (DESIGN.md 7)."""
+
+    name: str
+    gres: str  # Slurm GPU request; the model's memory needs decide it
+    mem: str  # Slurm CPU memory: weights pass through it on their way to the GPU
+    max_prompt_tokens: int  # what its text encoder reads; longer prompts are rejected
+    tokenizer: str  # "<hf repo>:<path of tokenizer.json>", for counting prompt tokens
+    guidance: str  # "always": negative prompt always used; "optional": only when the task gives one
+
+
+ENGINES = {
+    # SDXL: fits any GPU; its CLIP text encoders read 77 tokens; classic negative prompts.
+    "sdxl": Engine("sdxl", "gpu:1", "32G", 77, "openai/clip-vit-large-patch14:tokenizer.json", "always"),
+    # Qwen-Image-2.1: about 40 GB of GPU memory, so H200 (a100 mixes 40 and 80 GB cards).
+    # Meant to be sampled without guidance; a negative prompt turns guidance on (twice the time).
+    "qwen21": Engine("qwen21", "gpu:h200:1", "96G", 512, "Qwen/Qwen-Image-2.1:processor/tokenizer.json", "optional"),
+}
+
+
+@dataclass(frozen=True)
 class Style:
     """A LoRA a task can ask for with "style": <name> (DESIGN.md 7.1)."""
 
@@ -24,6 +45,7 @@ class Style:
     embeddings_sha256: str = ""
     embedding_tokens: tuple[str, ...] = ()
     hint: str = ""  # how to prompt this style; shown on the test page
+    engine: str = "sdxl"  # a LoRA works only with the model it was trained for
 
     def __post_init__(self) -> None:
         if not NAME.fullmatch(self.name):
@@ -37,6 +59,8 @@ class Style:
                 raise ValueError(f"style {self.name}: sha256 of {src} must be 64 hex digits")
         if self.embeddings and not self.embedding_tokens:
             raise ValueError(f"style {self.name}: embeddings need embedding_tokens")
+        if self.engine not in ENGINES:
+            raise ValueError(f"style {self.name}: engine must be one of {sorted(ENGINES)}")
         if not 0 < self.scale <= 2:
             raise ValueError(f"style {self.name}: scale must be in (0, 2]")
 
@@ -96,7 +120,8 @@ class Config:
     max_tasks_per_request: int = 100
     max_ids_per_status: int = 100
     min_disk_free_gb: float = 10
-    max_prompt_tokens: int = 77
+    # [generation]
+    default_engine: str = "qwen21"  # for tasks that name neither an engine nor a style
     # [downloads]
     civitai_token: str = ""  # only `deploy` uses it, to download Civitai LoRAs
     # [[styles]]
@@ -105,6 +130,8 @@ class Config:
     def __post_init__(self) -> None:
         if not re.fullmatch(r"[a-z0-9]{1,16}", self.env):
             raise ValueError(f"env must be 1-16 lowercase letters or digits, got {self.env!r}")
+        if self.default_engine not in ENGINES:
+            raise ValueError(f"default_engine must be one of {sorted(ENGINES)}, got {self.default_engine!r}")
 
     @property
     def root_dir(self) -> str:
@@ -140,11 +167,12 @@ _SECTIONS = {
     "queue": {"max_batch_images", "max_wait_s", "max_attempts", "batcher_interval_s", "idle_s", "handoff_timeout_s",
               "job_minutes", "warm_wait_s"},
     "poll": {"interval_s", "unreachable_after_s", "resubmit_after_s"},
-    "limits": {"max_tasks_per_request", "max_ids_per_status", "min_disk_free_gb", "max_prompt_tokens"},
+    "limits": {"max_tasks_per_request", "max_ids_per_status", "min_disk_free_gb"},
+    "generation": {"default_engine"},
     "downloads": {"civitai_token"},
 }
 _STYLE_KEYS = {"name", "source", "sha256", "trigger", "scale", "embeddings", "embeddings_sha256", "embedding_tokens",
-               "hint"}
+               "hint", "engine"}
 
 
 def load(path: Path) -> Config:

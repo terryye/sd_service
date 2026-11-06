@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     count           INTEGER NOT NULL,
     postprocess     TEXT NOT NULL,
     seed            INTEGER NOT NULL,
-    style           TEXT,               -- a configured LoRA style, or NULL for plain SDXL
+    style           TEXT,               -- a configured LoRA style, or NULL for the plain model
+    engine          TEXT NOT NULL DEFAULT 'sdxl',  -- sdxl | qwen21
     version         INTEGER NOT NULL,
     result          TEXT NOT NULL,      -- queued | running | success | needs_review | failed
     images          TEXT NOT NULL,      -- JSON list of {file, seed, result}
@@ -43,7 +44,8 @@ CREATE TABLE IF NOT EXISTS batches (
     created      REAL NOT NULL,
     submit_tried REAL,                  -- last upload + sbatch attempt
     finished     REAL,
-    handoff_at   REAL                   -- set while the batch is handed to a warm job, not sbatch'd
+    handoff_at   REAL,                  -- set while the batch is handed to a warm job, not sbatch'd
+    engine       TEXT NOT NULL DEFAULT 'sdxl'
 );
 """
 
@@ -60,6 +62,7 @@ class Task:
     postprocess: str
     seed: int
     style: str | None
+    engine: str
     version: int
     result: str
     images: list[dict]
@@ -87,6 +90,7 @@ class Batch:
     submit_tried: float | None
     finished: float | None
     handoff_at: float | None = None
+    engine: str = "sdxl"
 
 
 def _task(row: sqlite3.Row) -> Task:
@@ -114,12 +118,15 @@ class Database:
         self.conn.executescript(SCHEMA)
         # Columns added after the first release; older databases get them here.
         columns = {r["name"] for r in self.conn.execute("PRAGMA table_info(tasks)")}
-        added = (("style", "style TEXT"), ("negative_prompt", "negative_prompt TEXT NOT NULL DEFAULT ''"))
+        added = (("style", "style TEXT"), ("negative_prompt", "negative_prompt TEXT NOT NULL DEFAULT ''"),
+                 ("engine", "engine TEXT NOT NULL DEFAULT 'sdxl'"))  # tasks before engines were SDXL
         for column, ddl in added:
             if column not in columns:
                 self.conn.execute(f"ALTER TABLE tasks ADD COLUMN {ddl}")
-        if "handoff_at" not in {r["name"] for r in self.conn.execute("PRAGMA table_info(batches)")}:
-            self.conn.execute("ALTER TABLE batches ADD COLUMN handoff_at REAL")
+        batch_columns = {r["name"] for r in self.conn.execute("PRAGMA table_info(batches)")}
+        for column, ddl in (("handoff_at", "handoff_at REAL"), ("engine", "engine TEXT NOT NULL DEFAULT 'sdxl'")):
+            if column not in batch_columns:
+                self.conn.execute(f"ALTER TABLE batches ADD COLUMN {ddl}")
 
     def close(self) -> None:
         self.conn.close()
@@ -153,9 +160,9 @@ class Database:
             if old is None:
                 self.conn.execute(
                     "INSERT INTO tasks (taskid, prompt, negative_prompt, filename_prefix, count, postprocess, seed,"
-                    " style, version, result, images, error, attempts, batch_id, created, updated, queued_at)"
+                    " style, engine, version, result, images, error, attempts, batch_id, created, updated, queued_at)"
                     " VALUES (:taskid, :prompt, :negative_prompt, :filename_prefix, :count, :postprocess, :seed,"
-                    " :style, 1, 'queued', '[]', NULL, 0, NULL, :now, :now, :now)",
+                    " :style, :engine, 1, 'queued', '[]', NULL, 0, NULL, :now, :now, :now)",
                     {**task, "now": now},
                 )
                 return {"taskid": task["taskid"], "result": "queued", "version": 1}, None
@@ -169,7 +176,8 @@ class Database:
             self.conn.execute(
                 "UPDATE tasks SET prompt = :prompt, negative_prompt = :negative_prompt,"
                 " filename_prefix = :filename_prefix, count = :count,"
-                " postprocess = :postprocess, seed = :seed, style = :style, version = :version, result = 'queued',"
+                " postprocess = :postprocess, seed = :seed, style = :style, engine = :engine, version = :version,"
+                " result = 'queued',"
                 " images = '[]', error = NULL, attempts = 0, batch_id = NULL, updated = :now,"
                 " queued_at = :queued_at WHERE taskid = :taskid",
                 {**task, "version": version, "now": now, "queued_at": queued_at},
@@ -210,15 +218,16 @@ class Database:
 
     # ---- batches --------------------------------------------------------------
 
-    def claim_batch(self, prefix: str, taskids: list[str]) -> Batch:
+    def claim_batch(self, prefix: str, taskids: list[str], engine: str = "sdxl") -> Batch:
         """Move queued tasks into a new batch, in one transaction."""
         now = self.clock()
         with self._tx():
             seq = self.conn.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM batches").fetchone()[0]
             batch_id = f"{prefix}{seq:06d}"
             self.conn.execute(
-                "INSERT INTO batches (batch_id, seq, state, tasks, created) VALUES (?, ?, 'submitting', ?, ?)",
-                (batch_id, seq, json.dumps(taskids), now),
+                "INSERT INTO batches (batch_id, seq, state, tasks, created, engine)"
+                " VALUES (?, ?, 'submitting', ?, ?, ?)",
+                (batch_id, seq, json.dumps(taskids), now, engine),
             )
             marks = ",".join("?" * len(taskids))
             self.conn.execute(

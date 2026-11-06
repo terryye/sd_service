@@ -13,6 +13,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fake_cluster import FakeBackend  # noqa: E402
 
+pytest_plugins = ["worker_fakes"]  # the `generate` fixture
+
 from gateway.app import create_app  # noqa: E402
 from gateway.config import Config  # noqa: E402
 from gateway.service import Service  # noqa: E402
@@ -29,8 +31,8 @@ class Clock:
         self.t += seconds
 
 
-def word_tokens(text: str) -> int:
-    """Stands in for the CLIP tokenizer: one token per word, plus start and end."""
+def word_tokens(engine: str, text: str) -> int:
+    """Stands in for each engine's tokenizer: one token per word, plus start and end."""
     return len(text.split()) + 2
 
 
@@ -41,7 +43,8 @@ def clock() -> Clock:
 
 @pytest.fixture
 def config(tmp_path: Path) -> Config:
-    return Config(data_dir=tmp_path / "data", user="tester", env="test")
+    # The SDXL-era tests keep SDXL as the default; test_engines.py covers qwen21.
+    return Config(data_dir=tmp_path / "data", user="tester", env="test", default_engine="sdxl")
 
 
 @pytest.fixture

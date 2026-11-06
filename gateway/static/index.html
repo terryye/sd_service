@@ -85,10 +85,10 @@
   <div class="health" id="health"><span class="pill">health: loading…</span></div>
 
   <form id="form" class="card">
-    <label class="wide">Prompt (at most 77 tokens, about 50 words)
+    <label class="wide">Prompt
       <textarea id="prompt" required>a shiny red apple with a green leaf, cute cartoon sticker, white background</textarea>
     </label>
-    <label class="wide">Negative prompt (optional; added to the built-in safety terms, about 17 tokens left with sticker, 45 with none)
+    <label class="wide"><span id="negative-label">Negative prompt (optional)</span>
       <textarea id="negative" class="short" placeholder="e.g. green apple, worm"></textarea>
     </label>
     <label>Task ID <input id="taskid" required pattern="[A-Za-z0-9_-]{1,64}"></label>
@@ -96,8 +96,11 @@
     <label>Images
       <select id="count"><option>1</option><option selected>2</option><option>3</option><option>4</option></select>
     </label>
+    <label>Engine
+      <select id="engine"></select>
+    </label>
     <label>Style (LoRA)
-      <select id="style"><option value="">none (plain SDXL)</option></select>
+      <select id="style"><option value="">none</option></select>
     </label>
     <p id="style-hint" class="hint wide"></p>
     <label>Postprocess
@@ -190,16 +193,35 @@ async function refreshHealth() {
 
 let styles = {};           // name -> {trigger, scale, hint}, from /api/styles
 
+let engines = {};          // name -> {max_prompt_tokens, negative_prompt}, from /api/engines
+
 async function loadStyles() {
   try {
-    const body = await api("/api/styles");
-    styles = Object.fromEntries(body.styles.map((st) => [st.name, st]));
+    const [st, en] = await Promise.all([api("/api/styles"), api("/api/engines")]);
+    styles = Object.fromEntries(st.styles.map((s) => [s.name, s]));
+    engines = Object.fromEntries(en.engines.map((e) => [e.name, e]));
+    const esel = $("engine");
+    if (!esel.options.length) {
+      esel.replaceChildren(...en.engines.map((e) => { const o = el("option", null, e.name); o.value = e.name; return o; }));
+      esel.value = en.default;
+    }
   } catch { return; }
-  const sel = $("style"), keep = sel.value;
-  sel.replaceChildren(sel.options[0], ...Object.keys(styles).map((n) => {
+  fillStyleOptions();
+}
+
+// A LoRA works with one engine only: the style list shows the selected engine's styles.
+function fillStyleOptions() {
+  const sel = $("style"), keep = sel.value, engine = $("engine").value;
+  const names = Object.keys(styles).filter((n) => styles[n].engine === engine);
+  sel.replaceChildren(sel.options[0], ...names.map((n) => {
     const o = el("option", null, `${n} (${styles[n].trigger || "no trigger"})`); o.value = n; return o;
   }));
-  sel.value = styles[keep] ? keep : "";
+  sel.value = names.includes(keep) ? keep : "";
+  if (sel.value !== keep) onStyleChange();
+  const e = engines[engine];
+  $("negative-label").textContent = e
+    ? `Negative prompt (optional; ${e.negative_prompt}; prompts up to ${e.max_prompt_tokens} tokens)`
+    : "Negative prompt (optional)";
   showHint();
 }
 
@@ -228,6 +250,7 @@ function onStyleChange() {
   showHint();
 }
 $("style").addEventListener("change", onStyleChange);
+$("engine").addEventListener("change", fillStyleOptions);
 
 async function refreshTasks() {
   const pending = tasks.filter((t) => !FINISHED.has(status[t.taskid]?.result)).map((t) => t.taskid);
@@ -261,6 +284,7 @@ function render() {
     const card = el("div", "card");
     const top = el("div", "task-top");
     top.append(el("span", "taskid", t.taskid), el("span", `badge b-${s.result}`, s.result.replace("_", " ")));
+    if (s.engine) top.append(el("span", "badge b-queued", s.engine));
     if (s.style) top.append(el("span", "badge b-queued", `style: ${s.style}`));
     const meta = el("span", "meta", `submitted ${ago(t.submitted)}` + (s.version > 1 ? ` · version ${s.version}` : ""));
     top.append(meta);
@@ -297,6 +321,7 @@ $("form").addEventListener("submit", async (ev) => {
     on_duplicate: $("dup").value,
   };
   if ($("style").value) task.style = $("style").value;
+  task.engine = $("engine").value;
   if ($("prefix").value.trim()) task.filename_prefix = $("prefix").value.trim();
   $("submit").disabled = true;
   msg.className = ""; msg.textContent = "Submitting…";

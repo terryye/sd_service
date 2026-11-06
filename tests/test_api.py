@@ -52,7 +52,7 @@ def test_prompt_over_77_tokens_is_rejected(client):
     too_long = " ".join(["word"] * 76)
     a, b = submit(client, {"taskid": "ok", "prompt": ok}, {"taskid": "long", "prompt": too_long})
     assert a["result"] == "queued"
-    assert b == {"taskid": "long", "result": "rejected", "error": "prompt too long: 78 tokens, at most 77"}
+    assert b == {"taskid": "long", "result": "rejected", "error": "prompt too long: 78 tokens, at most 77 for sdxl"}
 
 
 def test_whole_request_errors(client):

@@ -54,7 +54,8 @@ def test_batch_payload_matches_the_job_contract(service, backend):
     service.submit([{"taskid": "a", "prompt": "a cat", "count": 3, "seed": 7, "filename_prefix": "cat",
                      "postprocess": "none"}])
     batch = run(service.batcher_tick())
-    assert backend.uploads[batch.batch_id] == {"batch_id": batch.batch_id, "styles": {}, "tasks": [
+    assert backend.uploads[batch.batch_id] == {
+        "batch_id": batch.batch_id, "engine": "sdxl", "styles": {}, "tasks": [
         {"taskid": "a", "version": 1, "prompt": "a cat", "count": 3, "style": None,
          "negative_prompt": SAFETY_NEGATIVE,  # postprocess none: safety terms only
          "seeds": [7, 7 + 1_000_003, 7 + 2_000_006], "postprocess": "none", "filename_prefix": "cat"}]}
@@ -270,7 +271,7 @@ def test_negative_prompt_counts_the_built_in_terms(service):
                                 {"taskid": "b", "prompt": "a cat", "negative_prompt": fits + " y"},
                                 {"taskid": "c", "prompt": "a cat", "negative_prompt": 5}])
     assert a["result"] == "queued"
-    assert b["error"] == ("negative_prompt too long: 78 tokens with the built-in terms, at most 77"
+    assert b["error"] == ("negative_prompt too long: 78 tokens with the built-in terms, at most 77 for sdxl"
                           " (about 46 left for yours)")
     assert c["error"] == "negative_prompt must be a string"
 
@@ -362,7 +363,8 @@ def test_idle_window_off_means_sbatch_every_time(service, backend, clock):
 def test_health_lists_warm_workers(client, service, backend, clock):
     first_batch_done_and_warm(service, backend, clock)
     run(service.poller_tick())  # nothing in flight: the heartbeat reads the warm workers
-    assert client.get("/api/health").json()["warm_workers"] == [{"job_id": "1001", "idle_left_s": 300}]
+    assert client.get("/api/health").json()["warm_workers"] == [
+        {"job_id": "1001", "engine": "sdxl", "idle_left_s": 300}]
 
 
 def test_with_a_warm_job_a_batch_goes_after_seconds_not_a_minute(service, backend, clock):

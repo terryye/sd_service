@@ -6,7 +6,7 @@ import pytest
 from conftest import run
 
 from gateway.cluster import SlurmBackend, parse_progress, parse_sacct, time_limit_minutes
-from gateway.config import Config, load
+from gateway.config import ENGINES, Config, load
 
 
 def recording(config):
@@ -44,7 +44,7 @@ def test_commands_stay_inside_the_environment(env):
     backend, calls = recording(config)
     batch_id = f"{config.batch_prefix}000007"
     run(backend.upload_batch(batch_id, {"batch_id": batch_id, "tasks": []}))
-    assert run(backend.submit(batch_id, 8)) == "4242"
+    assert run(backend.submit(batch_id, 8, ENGINES["sdxl"])) == "4242"
     run(backend.poll(batch_id))
     run(backend.fetch(batch_id, Path("/tmp/sdg-test-fetch")))
     run(backend.cleanup(batch_id, []))
@@ -61,6 +61,7 @@ def test_commands_stay_inside_the_environment(env):
     assert f"--job-name=sdg-{env}-000007" in submit and "--dependency=singleton" in submit
     assert submit.startswith(f"cd sd_service/{env} && sbatch")
     assert "--export=ALL,SDG_IDLE_S=300" in submit and "--time=92 " in submit
+    assert "--gres=gpu:1 --mem=32G" in submit
 
 
 def test_config_file(tmp_path):

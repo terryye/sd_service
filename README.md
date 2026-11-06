@@ -1,9 +1,9 @@
 # sd_service
 
-An internal image generation service for a kids' dictionary app. The app's backend submits prompts over HTTP; the service generates sticker-style illustrations (one subject, pure white background, 1024×1024 WebP) with SDXL on GPUs of Northeastern's Explorer HPC cluster, and serves the results.
+An internal image generation service for a kids' dictionary app. The app's backend submits prompts over HTTP; the service generates sticker-style illustrations (one subject, pure white background, 1024×1024 WebP) on GPUs of Northeastern's Explorer HPC cluster, and serves the results. It runs two image models: Qwen-Image-2.1 (the default) and SDXL (with optional LoRA styles).
 
 ```
-app backend ──HTTP──> gateway ──SSH, rsync──> Explorer: Slurm GPU job (SDXL)
+app backend ──HTTP──> gateway ──SSH, rsync──> Explorer: Slurm GPU job (Qwen-Image-2.1 or SDXL)
 ```
 
 The gateway runs outside the cluster: it queues tasks in SQLite, batches them into Slurm GPU jobs (up to 200 images, or after 60 s), polls the job every 30 s, and serves the finished images. A job stays warm for 5 minutes after its batch, so a batch that follows soon skips the queue wait and model start-up. All connections start at the gateway; the cluster never calls back. [DESIGN.md](DESIGN.md) has the full design.
@@ -17,6 +17,7 @@ The gateway runs outside the cluster: it queues tasks in SQLite, batches them in
 | `GET /api/images/tasks?ids=a,b,c` | bulk status |
 | `GET /api/health` | cluster reachability, queue length, free disk |
 | `GET /api/styles` | the configured LoRA styles, with trigger words and prompting tips |
+| `GET /api/engines` | the image models: `qwen21` (default) and `sdxl`, with prompt limits |
 | `GET /results/{taskid}/{prefix}_{n}.webp` | an image |
 | `GET /` | test page: submit a prompt, watch the status, preview the images |
 
@@ -50,8 +51,10 @@ Run `deploy` again whenever `cluster/` changes. Each environment (`dev`, `prod`)
 | Path | What it is |
 |---|---|
 | `gateway/` | the HTTP service: API, SQLite queue, batcher, poller, test page |
-| `cluster/` | runs on Explorer: `sd_job.sh` (Slurm job), `generate.py` (SDXL), `postprocess.py` (white background, pattern and cut-off checks) |
+| `cluster/` | runs on Explorer: `sd_job.sh` (Slurm job), `generate.py` (the worker: Qwen-Image-2.1 or SDXL), `postprocess.py` (white background, pattern and cut-off checks) |
 | `tests/` | unit tests with a fake cluster |
 | `DESIGN.md` | the design |
 
-On the cluster, `~/sd_service/` holds the pinned PyTorch container, the SDXL model cache (about 7 GB), and one folder per environment.
+On the cluster, `~/sd_service/` holds the pinned PyTorch container, the model cache (Qwen-Image-2.1 about 33 GB, SDXL about 7 GB), and one folder per environment.
+
+Qwen-Image-2.1 is under the Qwen Research License: research and evaluation only, no commercial use without a separate license.

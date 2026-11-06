@@ -32,7 +32,7 @@ def test_trigger_words_count_toward_the_token_limit(styled):
     [a, b] = styled.submit([{"taskid": "a", "prompt": fits, "style": "vector"},
                             {"taskid": "b", "prompt": fits + " more", "style": "vector"}])
     assert a["result"] == "queued"
-    assert b["error"] == "prompt too long: 78 tokens, at most 77"
+    assert b["error"] == "prompt too long: 78 tokens, at most 77 for sdxl"
 
 
 def test_payload_carries_the_full_prompt_and_only_the_styles_in_use(styled, backend):
@@ -96,5 +96,5 @@ def test_styles_endpoint_lists_triggers_and_hints(client, service):
                    trigger="pixel art", hint="one simple subject")
     tune(service, styles={"pixel": hinted, "vector": VECTOR})
     assert client.get("/api/styles").json() == {"styles": [
-        {"name": "pixel", "trigger": "pixel art", "scale": 1.0, "hint": "one simple subject"},
-        {"name": "vector", "trigger": "color icon", "scale": 1.0, "hint": ""}]}
+        {"name": "pixel", "engine": "sdxl", "trigger": "pixel art", "scale": 1.0, "hint": "one simple subject"},
+        {"name": "vector", "engine": "sdxl", "trigger": "color icon", "scale": 1.0, "hint": ""}]}

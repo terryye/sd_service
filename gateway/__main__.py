@@ -14,22 +14,25 @@ import time
 from pathlib import Path
 
 from .cluster import ClusterError, SlurmBackend
-from .config import Config, download_url, load
+from .config import ENGINES, Config, download_url, load
 
 CLUSTER_FILES = ["sd_job.sh", "generate.py", "postprocess.py"]
 SHARED_SIF = "/shared/container_repository/explorer/pytorch/pytorch_training.sif"
-CLIP_TOKENIZER = "openai/clip-vit-large-patch14"  # same BPE vocabulary as both SDXL text encoders
-
-
-def clip_token_counter(config: Config):
+def token_counter(config: Config):
+    """count(engine, text): prompt length in each engine's own tokenizer (Engine.tokenizer)."""
+    from huggingface_hub import hf_hub_download
     from tokenizers import AddedToken, Tokenizer
 
-    tokenizer = Tokenizer.from_pretrained(CLIP_TOKENIZER)
-    # A style's learned embedding tokens (e.g. <s0>) are one token each once the job loads them.
-    extra = sorted({t for s in config.styles.values() for t in s.embedding_tokens})
-    if extra:
-        tokenizer.add_tokens([AddedToken(t, single_word=False, normalized=False) for t in extra])
-    return lambda text: len(tokenizer.encode(text).ids)  # includes the start and end tokens
+    tokenizers = {}
+    for name, engine in ENGINES.items():
+        repo, _, path = engine.tokenizer.partition(":")
+        tokenizer = Tokenizer.from_file(hf_hub_download(repo, path))
+        # A style's learned embedding tokens (e.g. <s0>) are one token each once the job loads them.
+        extra = sorted({t for s in config.styles.values() if s.engine == name for t in s.embedding_tokens})
+        if extra:
+            tokenizer.add_tokens([AddedToken(t, single_word=False, normalized=False) for t in extra])
+        tokenizers[name] = tokenizer
+    return lambda engine, text: len(tokenizers[engine].encode(text).ids)
 
 
 def serve(config: Config) -> None:
@@ -38,7 +41,7 @@ def serve(config: Config) -> None:
     from .app import create_app
     from .service import Service
 
-    service = Service(config, SlurmBackend(config), clip_token_counter(config), time.time)
+    service = Service(config, SlurmBackend(config), token_counter(config), time.time)
     uvicorn.run(create_app(service), host=config.host, port=config.port)
 
 

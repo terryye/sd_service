@@ -31,6 +31,7 @@ class FakeBackend:
         self.claimed: set[str] = set()  # out/<batch>/claimed
         self.finished: set[str] = set()  # out/<batch>/finished
         self.hand_off_fails = False
+        self.submit_engines: list[str] = []
 
     def _check(self) -> None:
         if self.down:
@@ -43,9 +44,10 @@ class FakeBackend:
         self._check()
         self.uploads[batch_id] = json.loads(json.dumps(payload))
 
-    async def submit(self, batch_id: str, n_images: int) -> str:
+    async def submit(self, batch_id: str, n_images: int, engine) -> str:
         self._check()
         self.submits.append(batch_id)
+        self.submit_engines.append(engine.name)
         fail = self.submit_fails.pop(0) if self.submit_fails else False
         if fail and not self.ghost:
             raise ClusterError("sbatch: error: Batch job submission failed: Unexpected message received")
@@ -97,8 +99,9 @@ class FakeBackend:
 
     # ---- what the warm worker would do ----------------------------------------------
 
-    def go_warm(self, job_id: str, idle_until: float, job_end: float) -> None:
-        self.warm = [w for w in self.warm if w.job_id != job_id] + [WarmWorker(job_id, idle_until, job_end, "RUNNING")]
+    def go_warm(self, job_id: str, idle_until: float, job_end: float, engine: str = "sdxl") -> None:
+        self.warm = [w for w in self.warm if w.job_id != job_id] + [
+            WarmWorker(job_id, idle_until, job_end, "RUNNING", engine)]
 
     def claim(self, job_id: str) -> str:
         batch_id = self.inbox.pop(job_id)

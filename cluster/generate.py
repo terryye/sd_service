@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""The SDXL worker of one Slurm job (DESIGN.md 6.1, 6.5 and 7).
+"""The image worker of one Slurm job (DESIGN.md 6.1, 6.5 and 7).
 
 Runs the batch it was started for, then stays warm for up to --idle-s seconds, in
-case the gateway hands it another batch, and runs that too. The model and the LoRA
-styles are loaded once per job.
+case the gateway hands it another batch, and runs that too. The model (the engine
+named in the first batch: SDXL or Qwen-Image-2.1) and any LoRA styles are loaded
+once per job; a warm job only takes batches for its own engine.
 
 For each batch, under the environment directory:
   reads  batches/<batch_id>/batch.json
@@ -31,16 +32,19 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
+import diffusers
 import torch
-from diffusers import AutoencoderKL, StableDiffusionXLPipeline
 from postprocess import needs_retry, whiten_background
 
-MODEL = "stabilityai/stable-diffusion-xl-base-1.0"
+SDXL = "stabilityai/stable-diffusion-xl-base-1.0"
 # SDXL's own VAE overflows in fp16 and can return black images; this is the standard fix.
-VAE = "madebyollin/sdxl-vae-fp16-fix"
+SDXL_VAE = "madebyollin/sdxl-vae-fp16-fix"
+SDXL_STEPS = 30
+SDXL_GUIDANCE = 6.0
+QWEN21 = "Qwen/Qwen-Image-2.1"
+QWEN21_STEPS = 40  # the model card's setting
+QWEN21_CFG = 4.0  # only used when a task has a negative prompt; 2.1 is meant to run without guidance
 SIZE = 1024
-STEPS = 30
-GUIDANCE = 6.0
 MAX_TRIES = 4
 WEBP_QUALITY = 90
 INBOX_POLL_S = 2
@@ -133,24 +137,43 @@ def adapter_name(style: dict) -> str:
     return Path(style["lora"]).stem.replace(".", "_")
 
 
+def load_pipeline(engine: str):
+    if engine == "qwen21":
+        pipe = diffusers.QwenImage21Pipeline.from_pretrained(QWEN21, dtype=torch.bfloat16)
+    elif engine == "sdxl":
+        vae = diffusers.AutoencoderKL.from_pretrained(SDXL_VAE, dtype=torch.float16)
+        stamp("VAE loaded")
+        pipe = diffusers.StableDiffusionXLPipeline.from_pretrained(
+            SDXL, vae=vae, dtype=torch.float16, variant="fp16", use_safetensors=True
+        )
+    else:
+        raise ValueError(f"unknown engine {engine!r}")
+    stamp(f"{engine} pipeline loaded")
+    pipe = pipe.to("cuda")
+    pipe.set_progress_bar_config(disable=True)
+    stamp("moved to GPU")
+    return pipe
+
+
 class Worker:
-    def __init__(self, pipe, env: Path, loras: Path):
+    def __init__(self, pipe, engine: str, env: Path, loras: Path):
         self.pipe = pipe
+        self.engine = engine
         self.env = env
         self.loras = loras
         self.loaded: set[str] = set()  # adapters loaded in this job
         self.broken: dict[str, str] = {}  # adapter -> load error; fails only its own tasks
 
     def generate(self, prompt: str, negative: str, seeds: list[int]):
-        return self.pipe(
-            prompt=[prompt] * len(seeds),
-            negative_prompt=[negative] * len(seeds),
-            num_inference_steps=STEPS,
-            guidance_scale=GUIDANCE,
-            height=SIZE,
-            width=SIZE,
-            generator=[torch.Generator("cuda").manual_seed(s) for s in seeds],
-        ).images
+        n = len(seeds)
+        common = dict(prompt=[prompt] * n, height=SIZE, width=SIZE,
+                      generator=[torch.Generator("cuda").manual_seed(s) for s in seeds])
+        if self.engine == "qwen21":
+            if negative:  # the gateway sends one only when the task asked for it
+                common.update(negative_prompt=[negative] * n, true_cfg_scale=QWEN21_CFG)
+            return self.pipe(num_inference_steps=QWEN21_STEPS, **common).images
+        return self.pipe(negative_prompt=[negative] * n, num_inference_steps=SDXL_STEPS,
+                         guidance_scale=SDXL_GUIDANCE, **common).images
 
     def run_batch(self, batch_id: str) -> None:
         batch = json.loads((self.env / "batches" / batch_id / "batch.json").read_text(encoding="utf-8"))
@@ -160,6 +183,13 @@ class Worker:
         done = done_tasks(progress)
         todo = [t for t in batch["tasks"] if (t["taskid"], t["version"]) not in done]
         stamp(f"{batch_id}: {len(batch['tasks'])} tasks, {len(todo)} to do")
+        engine = batch.get("engine", "sdxl")
+        if engine != self.engine:  # the gateway only hands a warm job its own engine; refuse, don't guess
+            for task in todo:
+                append_line(progress, {"taskid": task["taskid"], "version": task["version"], "ts": now(),
+                                       "error": f"batch for engine {engine} reached a {self.engine} job"})
+            write_atomic(out / "finished", now())
+            return
 
         # Load the styles this batch needs that this job hasn't loaded yet.
         styles = batch.get("styles", {})
@@ -238,7 +268,8 @@ class Worker:
         workers.mkdir(exist_ok=True)
         inbox.mkdir(exist_ok=True)
         announce = workers / f"{job_id}.json"
-        write_atomic(announce, json.dumps({"job_id": job_id, "idle_until": deadline, "job_end": job_end}))
+        write_atomic(announce, json.dumps({"job_id": job_id, "idle_until": deadline, "job_end": job_end,
+                                           "engine": self.engine}))
         stamp(f"warm: waiting up to {deadline - time.time():.0f}s for another batch")
         try:
             box, claimed = inbox / job_id, inbox / f"{job_id}.claimed"
@@ -276,17 +307,9 @@ def main() -> int:
     args = p.parse_args()
 
     stamp("imports done")
-    vae = AutoencoderKL.from_pretrained(VAE, dtype=torch.float16)
-    stamp("VAE loaded")
-    pipe = StableDiffusionXLPipeline.from_pretrained(
-        MODEL, vae=vae, dtype=torch.float16, variant="fp16", use_safetensors=True
-    )
-    stamp("pipeline loaded")
-    pipe = pipe.to("cuda")
-    pipe.set_progress_bar_config(disable=True)
-    stamp("moved to GPU")
-
-    worker = Worker(pipe, args.env, args.loras)
+    first = json.loads((args.env / "batches" / args.batch_id / "batch.json").read_text(encoding="utf-8"))
+    engine = first.get("engine", "sdxl")
+    worker = Worker(load_pipeline(engine), engine, args.env, args.loras)
     batch_id = args.batch_id
     while batch_id:
         worker.run_batch(batch_id)

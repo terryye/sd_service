@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
-from .config import Config
+from .config import Config, Engine
 
 # Slurm states after which a job will never run again.
 TERMINAL = {"COMPLETED", "FAILED", "TIMEOUT", "NODE_FAIL", "CANCELLED", "OUT_OF_MEMORY",
@@ -47,12 +47,13 @@ class WarmWorker:
     idle_until: float  # Unix seconds; the worker exits then unless handed a batch
     job_end: float  # Slurm's end time for the job
     state: str  # from sacct; only RUNNING workers are handed work
+    engine: str = "sdxl"  # the model it has loaded; it only takes batches for that engine
 
 
 class ClusterBackend(Protocol):
     async def ping(self) -> None: ...
     async def upload_batch(self, batch_id: str, payload: dict) -> None: ...
-    async def submit(self, batch_id: str, n_images: int) -> str: ...
+    async def submit(self, batch_id: str, n_images: int, engine: Engine) -> str: ...
     async def poll(self, batch_id: str, job_id: str | None = None) -> PollResult: ...
     async def fetch(self, batch_id: str, dest: Path) -> None: ...
     async def cleanup(self, batch_id: str, cancel: list[str]) -> None: ...
@@ -143,10 +144,11 @@ class SlurmBackend:
         await self._xfer(f"mkdir -p {d} && cat > {tmp} && mv {tmp} {f}",
                          stdin=json.dumps(payload).encode())
 
-    async def submit(self, batch_id: str, n_images: int) -> str:
+    async def submit(self, batch_id: str, n_images: int, engine: Engine) -> str:
         name = shlex.quote(batch_id)
         out = await self._login(
             f"cd {self._path()} && sbatch --parsable --job-name={name} --dependency=singleton"
+            f" --gres={shlex.quote(engine.gres)} --mem={shlex.quote(engine.mem)}"
             f" --time={time_limit_minutes(n_images, self.c.job_minutes)}"
             f" --export=ALL,SDG_IDLE_S={int(self.c.idle_s)} sd_job.sh {name}"
         )
@@ -188,7 +190,7 @@ class SlurmBackend:
             try:
                 w = json.loads(line)
                 found.append(WarmWorker(str(w["job_id"]), float(w["idle_until"]), float(w["job_end"]),
-                                        states.get(str(w["job_id"]), "UNKNOWN")))
+                                        states.get(str(w["job_id"]), "UNKNOWN"), str(w.get("engine", "sdxl"))))
             except (json.JSONDecodeError, KeyError, TypeError, ValueError):
                 continue  # a file being rewritten; seen again next time
         return found

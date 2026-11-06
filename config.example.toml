@@ -29,6 +29,9 @@ max_tasks_per_request = 100
 max_ids_per_status = 100
 min_disk_free_gb = 10
 
+[generation]
+default_engine = "qwen21"     # qwen21 (Qwen-Image-2.1, H200) or sdxl; a task can pick with "engine"
+
 [downloads]
 civitai_token = ""            # Civitai API key; only `deploy` uses it, to download Civitai LoRAs
 
@@ -42,6 +45,7 @@ civitai_token = ""            # Civitai API key; only `deploy` uses it, to downl
 # sha256 = "b0024ab16d212bb1f08ccbc3b25cbe781e3aef8b00f91526778ca1b1a2c61480"
 # trigger = "color icon"       # added in front of the prompt unless it already contains it
 # scale = 0.8                  # LoRA strength, 0-2
+# engine = "sdxl"            # the model this LoRA was trained for
 # hint = 'keep prompts short and simple'   # optional, shown on the test page
 #
 # A Civitai LoRA (source = "civitai:<id>") needs civitai_token above. A LoRA trained

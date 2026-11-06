@@ -5,3 +5,6 @@ __pycache__/
 # Local settings and gateway state
 config.toml
 data/
+
+# Local experiments (not part of the service)
+experiments/

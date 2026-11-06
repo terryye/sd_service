@@ -52,13 +52,14 @@ This is an internal service. Only the dictionary app's backend calls it, and app
 |---|---|---|---|
 | `taskid` | yes | - | globally unique; `[A-Za-z0-9_-]`, 1-64 characters |
 | `prompt` | yes | - | at most 77 tokens, SDXL's limit (about 50-60 words; see 7) |
-| `negative_prompt` | no | empty | added after the built-in negative terms (7), never replacing them; the whole negative prompt must fit in 77 tokens, which leaves about 17 for `sticker` tasks and 45 for `none` |
+| `negative_prompt` | no | empty | added after the built-in negative terms (7), never replacing them. `sdxl`: the whole negative prompt must fit in 77 tokens (about 17 left for `sticker` tasks, 45 for `none`). `qwen21`: giving one turns guidance on, about twice the time |
 | `filename_prefix` | no | the taskid | `[A-Za-z0-9_-]`, 1-64 characters; files are `<prefix>_<n>.webp` |
 | `count` | no | 1 | 1-4 candidate images |
 | `on_duplicate` | no | `reject` | `reject` or `replace` (section 4.2) |
 | `postprocess` | no | `sticker` | `sticker` (white background + pattern retry) or `none` |
 | `seed` | no | random | seed for image 1; images 2..N derive their seeds from it. Similar, not identical, results across GPU types (see 12) |
 | `style` | no | none | a LoRA style configured in `config.toml` (7.1); its trigger words are added in front of the prompt unless the prompt already contains them |
+| `engine` | no | `default_engine` (`qwen21`) | `qwen21` or `sdxl` (7). A style decides it: a style's LoRA works with one engine only |
 
 **Response:** `202`, with one entry per task, in request order. Each task is accepted or rejected on its own:
 
@@ -116,6 +117,10 @@ At most 100 ids per call; more gives a `400`. Entries come back in the order req
 ```
 
 `styles` lists the configured style names. `warm_workers` lists jobs waiting for another batch (6.5). `status` is `degraded` when the cluster has been unreachable for more than 5 minutes, or when free disk falls below a configured threshold.
+
+### 3.4b Engines
+
+`GET /api/engines`: the default engine and, per engine, its prompt limit and how it treats a negative prompt.
 
 ### 3.4a Styles
 
@@ -275,7 +280,7 @@ Start-up (container, packages, loading SDXL) costs from under a minute to severa
 ```
 ~/sd_service/
   pytorch.sif        pinned copy of RC's PyTorch container (shared by all environments)
-  hf_cache/          SDXL model weights, about 7 GB (shared)
+  hf_cache/          model weights: SDXL about 7 GB, Qwen-Image-2.1 about 33 GB (shared)
   loras/             LoRA style files, named <style>-<first 12 hex of sha256> (shared)
   dev/  prod/        one directory per environment: cluster code, batches/, out/, logs/
 ```
@@ -283,13 +288,26 @@ Start-up (container, packages, loading SDXL) costs from under a minute to severa
 - **One directory per environment.** The dev gateway (on the Mac) and the prod gateway (on the server) must not see each other's batches: they would overwrite each other's files, and the "lowest job ID with this name wins" rule would mix their jobs. So each environment has its own directory and its own batch and job-name prefix (`sdg-dev-…`, `sdg-prod-…`), set by `env` in the config. Each also has its own copy of the cluster code, so testing new code in dev never touches prod.
 - **A pinned container.** RC can replace `/shared/container_repository/explorer/pytorch/pytorch_training.sif` at any time (it last changed on Oct 20, 2026), and a new torch or transformers inside it could break the pinned `diffusers`. The service runs from its own copy, `~/sd_service/pytorch.sif` (4.3 GB, one file, so shared storage handles it well). It is refreshed only on purpose, after testing in dev.
 - **Python packages:** `diffusers==0.42.1`, `peft==0.21.2` (for LoRAs) and their few missing dependencies are installed into node-local `/tmp` in each job.
-- **Disk:** the shared files take about 11 GB of the 75 GB home quota. Batch output is temporary and is removed after the gateway pulls it.
+- **Disk:** the shared files take about 43 GB of the 75 GB home quota. Batch output is temporary and is removed after the gateway pulls it.
 
 ## 7. Image pipeline
 
-- **Model:** SDXL base 1.0 with the fp16-fix VAE, 30 steps, guidance 6.0, always 1024×1024.
-- **Prompt length:** SDXL's text encoders read at most 77 tokens and silently ignore the rest. The gateway counts tokens at submit time with SDXL's CLIP tokenizer and rejects longer prompts with `prompt too long`, so a prompt is never cut off without the client knowing.
-- **Negative prompt:** the gateway builds it: the kids' safety terms (32 tokens) always, the sticker terms for `sticker` tasks (60 tokens together), then the task's own `negative_prompt`. It must fit in SDXL's 77 tokens; a longer one is rejected with the room that was left.
+Two engines; each task picks one (`engine`, default `default_engine` in `config.toml`). A batch holds one engine only, so a job loads one model, and a warm job (6.5) only takes batches of its own engine.
+
+| | `qwen21` (default) | `sdxl` |
+|---|---|---|
+| Model | Qwen-Image-2.1, 40 steps, bf16 | SDXL base 1.0 + fp16-fix VAE, 30 steps, guidance 6.0 |
+| GPU, CPU memory | `gpu:h200:1`, 96 GB (about 40 GB of GPU memory; the cluster's `a100` mixes 40 and 80 GB cards) | `gpu:1`, 32 GB |
+| Prompt limit | 512 tokens (Qwen tokenizer) | 77 tokens (CLIP tokenizer); its text encoders silently ignore the rest |
+| Negative prompt | none by default (the model is meant to run without guidance); a task's `negative_prompt` turns guidance on (`true_cfg_scale` 4.0, about twice the time) with the built-in terms included | always: the built-in terms plus the task's own |
+| Speed (H200) | about 6 s per image | about 2 s per image |
+| LoRA styles | none configured | `[[styles]]` with `engine = "sdxl"` |
+| License | **non-commercial** (Qwen Research License: research and evaluation only) | CreativeML Open RAIL++-M |
+
+Both run at 1024×1024 and go through the same postprocessing. A Qwen-Image-2.1 bake-off against SDXL and Qwen-Image-2512 (same prompts and seed) showed 2.1 drawing one clean object on white without the sticker tricks, and spelling words correctly. SDXL drew repeating patterns for 5 of 7 prompts.
+
+- **Prompt length:** the gateway counts tokens at submit time with each engine's own tokenizer and rejects longer prompts with `prompt too long`, so a prompt is never cut off without the client knowing.
+- **Negative prompt:** the gateway builds it: the kids' safety terms (32 SDXL tokens) always, the sticker terms for `sticker` tasks (60 together), then the task's own `negative_prompt`. It must fit in the engine's limit; a longer one is rejected with the room that was left. For `qwen21` it is sent only when the task gives one, so a plain `qwen21` task has no safety negative terms.
 - **`postprocess: sticker`:**
   - whiten the background: the edge-connected flat background, holes that match it, stray specks, and the light grey haze of a soft shadow around the sticker;
   - check for a repeating pattern or an object cut off by the image edge, and if found, retry with the next seed, up to 4 tries;

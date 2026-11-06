@@ -19,14 +19,14 @@ from pathlib import Path
 from PIL import Image
 
 from .cluster import TERMINAL, ClusterBackend, ClusterError
-from .config import Config
+from .config import ENGINES, Config
 from .db import Batch, Database, Task
 
 log = logging.getLogger("gateway")
 
 NAME = re.compile(r"[A-Za-z0-9_-]{1,64}")
 FIELDS = {"taskid", "prompt", "negative_prompt", "filename_prefix", "count", "on_duplicate", "postprocess",
-          "seed", "style"}
+          "seed", "style", "engine"}
 IMAGE_SIZE = (1024, 1024)
 
 # Always in the negative prompt: keeps every image suitable for young children (32 tokens).
@@ -41,6 +41,17 @@ def full_negative(postprocess: str, extra: str) -> str:
     """The negative prompt the model reads: built-in terms first, then the client's own."""
     parts = [SAFETY_NEGATIVE] + ([STICKER_NEGATIVE] if postprocess == "sticker" else []) + ([extra] if extra else [])
     return ", ".join(parts)
+
+
+def task_negative(engine: str, postprocess: str, extra: str) -> str:
+    """The negative prompt sent to the job; empty means sample without guidance.
+
+    SDXL always uses one. Qwen-Image-2.1 is meant to run without guidance, so it
+    gets one (built-in terms included) only when the task asks for a negative prompt.
+    """
+    if ENGINES[engine].guidance == "optional" and not extra:
+        return ""
+    return full_negative(postprocess, extra)
 
 
 def iso(t: float | None) -> str | None:
@@ -99,23 +110,30 @@ class Service:
         if style is not None and style not in self.c.styles:
             names = ", ".join(sorted(self.c.styles)) or "none configured"
             return None, "reject", f"unknown style {style!r} (available: {names})"
-        # The style's trigger words are part of what SDXL reads, so they count too.
+        # A style's LoRA belongs to one engine, so the style decides it.
+        engine = raw.get("engine", self.c.styles[style].engine if style else self.c.default_engine)
+        if engine not in ENGINES:
+            return None, "reject", f"engine must be one of {', '.join(sorted(ENGINES))}"
+        if style and self.c.styles[style].engine != engine:
+            return None, "reject", f"style {style!r} works only with engine {self.c.styles[style].engine}"
+        limit = ENGINES[engine].max_prompt_tokens
+        # The style's trigger words are part of what the model reads, so they count too.
         full = self.c.styles[style].full_prompt(prompt.strip()) if style else prompt.strip()
-        tokens = self.count_tokens(full)
-        if tokens > self.c.max_prompt_tokens:
-            return None, "reject", f"prompt too long: {tokens} tokens, at most {self.c.max_prompt_tokens}"
+        tokens = self.count_tokens(engine, full)
+        if tokens > limit:
+            return None, "reject", f"prompt too long: {tokens} tokens, at most {limit} for {engine}"
         negative = raw.get("negative_prompt", "")
         if not isinstance(negative, str):
             return None, "reject", "negative_prompt must be a string"
         negative = negative.strip()
-        # SDXL reads at most 77 tokens of the negative prompt too, built-in terms included.
-        neg_tokens = self.count_tokens(full_negative(postprocess, negative))
-        if neg_tokens > self.c.max_prompt_tokens:
-            room = self.c.max_prompt_tokens - self.count_tokens(full_negative(postprocess, ""))
+        # The negative prompt has the same limit, built-in terms included.
+        neg_tokens = self.count_tokens(engine, task_negative(engine, postprocess, negative))
+        if neg_tokens > limit:
+            room = limit - self.count_tokens(engine, full_negative(postprocess, ""))
             return None, "reject", (f"negative_prompt too long: {neg_tokens} tokens with the built-in terms, "
-                                    f"at most {self.c.max_prompt_tokens} (about {room} left for yours)")
+                                    f"at most {limit} for {engine} (about {room} left for yours)")
         task = {"taskid": taskid, "prompt": prompt.strip(), "negative_prompt": negative, "filename_prefix": prefix,
-                "count": count, "postprocess": postprocess, "seed": seed, "style": style}
+                "count": count, "postprocess": postprocess, "seed": seed, "style": style, "engine": engine}
         return task, on_duplicate, None
 
     def submit(self, entries: list) -> list[dict]:
@@ -139,6 +157,7 @@ class Service:
                 "created": iso(task.created), "updated": iso(task.updated),
                 "images": [{"url": f"/results/{task.taskid}/{i['file']}?v={task.version}",
                             "seed": i["seed"], "result": i["result"]} for i in task.images]}
+        view["engine"] = task.engine
         if task.style:
             view["style"] = task.style
         if task.negative_prompt:
@@ -161,7 +180,7 @@ class Service:
                 "last_poll": iso(self.last_ok), **self.db.queue_stats(),
                 "batches_in_flight": len(self.db.in_flight()),
                 "disk_free_gb": round(disk_free, 1), "styles": sorted(self.c.styles),
-                "warm_workers": [{"job_id": w.job_id, "idle_left_s": round(w.idle_until - now)}
+                "warm_workers": [{"job_id": w.job_id, "engine": w.engine, "idle_left_s": round(w.idle_until - now)}
                                  for w in self.warm if w.state == "RUNNING" and w.idle_until > now]}
 
     # ---- batcher ------------------------------------------------------------------
@@ -179,10 +198,14 @@ class Service:
             waited = now - min(t.queued_at for t in queued)
             # Waiting gathers tasks to share one cold start. With a job already warm there is
             # no start-up to share, so send almost at once.
-            warm = self.c.idle_s > 0 and any(w.state == "RUNNING" and w.idle_until - now >= 15 for w in self.warm)
+            warm = self.c.idle_s > 0 and any(w.state == "RUNNING" and w.engine == queued[0].engine
+                                             and w.idle_until - now >= 15 for w in self.warm)
             max_wait = self.c.warm_wait_s if warm else self.c.max_wait_s
             if total < self.c.max_batch_images and waited < max_wait:
                 return None
+            # One engine per batch, so a job loads one model: the oldest task's engine.
+            engine = queued[0].engine
+            queued = [t for t in queued if t.engine == engine]
             chosen, images = [], 0
             for t in queued:  # first in, first out; a task is never split
                 if images + t.count > self.c.max_batch_images:
@@ -196,8 +219,8 @@ class Service:
                     chosen.remove(t.taskid)
             if not chosen:
                 return None
-            batch = self.db.claim_batch(self.c.batch_prefix, chosen)
-            log.info("batch %s: %d tasks, %d images", batch.batch_id, len(chosen), images)
+            batch = self.db.claim_batch(self.c.batch_prefix, chosen, engine)
+            log.info("batch %s: %d tasks, %d images, engine %s", batch.batch_id, len(chosen), images, engine)
             if not (self.c.idle_s > 0 and await self._try_hand_off(batch, images)):
                 await self._try_submit(batch)
             return self.db.get_batch(batch.batch_id)
@@ -212,7 +235,8 @@ class Service:
         now = self.clock()
         need = 15 * images + 600  # generation, plus ten minutes to spare before the job's time limit
         fit = [w for w in workers
-               if w.state == "RUNNING" and w.idle_until - now >= 15 and w.job_end - now >= need]
+               if w.state == "RUNNING" and w.engine == batch.engine and w.idle_until - now >= 15
+               and w.job_end - now >= need]
         if not fit:
             if workers:
                 log.info("batch %s: no warm job fits (%d images, need %.0fs left); using sbatch",
@@ -240,10 +264,10 @@ class Service:
             s = self.c.styles[name]
             styles[name] = {"lora": s.lora_file, "scale": s.scale,
                             "embeddings": s.embeddings_file or None, "tokens": list(s.embedding_tokens)}
-        return {"batch_id": batch.batch_id, "styles": styles, "tasks": [
+        return {"batch_id": batch.batch_id, "engine": batch.engine, "styles": styles, "tasks": [
             {"taskid": t.taskid, "version": t.version, "count": t.count, "seeds": t.seeds(),
              "prompt": self.c.styles[t.style].full_prompt(t.prompt) if t.style else t.prompt,
-             "negative_prompt": full_negative(t.postprocess, t.negative_prompt),
+             "negative_prompt": task_negative(t.engine, t.postprocess, t.negative_prompt),
              "style": t.style, "postprocess": t.postprocess, "filename_prefix": t.filename_prefix}
             for t in tasks]}
 
@@ -253,7 +277,8 @@ class Service:
         payload = self.batch_payload(batch)
         try:
             await self.backend.upload_batch(batch.batch_id, payload)
-            job_id = await self.backend.submit(batch.batch_id, sum(t["count"] for t in payload["tasks"]))
+            job_id = await self.backend.submit(batch.batch_id, sum(t["count"] for t in payload["tasks"]),
+                                               ENGINES[batch.engine])
         except ClusterError as exc:
             self._cluster_failed()
             log.warning("batch %s: submit failed, will look it up before resubmitting: %s",
@@ -382,7 +407,7 @@ class Service:
         def ids(ws):
             return sorted(w.job_id for w in ws if w.state == "RUNNING" and w.idle_until > now)
         if ids(workers) != ids(self.warm):
-            shown = ", ".join(f"{w.job_id} ({w.idle_until - now:.0f}s left)" for w in workers
+            shown = ", ".join(f"{w.job_id} ({w.engine}, {w.idle_until - now:.0f}s left)" for w in workers
                               if w.state == "RUNNING" and w.idle_until > now) or "none"
             log.info("warm jobs: %s", shown)
         self.warm = workers

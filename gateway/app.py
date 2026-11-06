@@ -11,6 +11,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from .config import ENGINES
 from .service import Service
 
 log = logging.getLogger("gateway")
@@ -84,8 +85,17 @@ def create_app(service: Service, run_loops: bool = True) -> FastAPI:
 
     @app.get("/api/styles")
     async def styles():
-        return {"styles": [{"name": s.name, "trigger": s.trigger, "scale": s.scale, "hint": s.hint}
+        return {"styles": [{"name": s.name, "engine": s.engine, "trigger": s.trigger, "scale": s.scale,
+                            "hint": s.hint}
                            for s in sorted(service.c.styles.values(), key=lambda s: s.name)]}
+
+    @app.get("/api/engines")
+    async def engines():
+        return {"default": service.c.default_engine, "engines": [
+            {"name": e.name, "max_prompt_tokens": e.max_prompt_tokens,
+             "negative_prompt": "always used" if e.guidance == "always"
+             else "optional; giving one turns guidance on, about twice the time"}
+            for e in ENGINES.values()]}
 
     @app.get("/", include_in_schema=False)
     async def test_page():
