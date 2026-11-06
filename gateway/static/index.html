@@ -35,6 +35,7 @@
   input, select, textarea { font: inherit; color: var(--ink); background: var(--bg);
           border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
   textarea { min-height: 72px; resize: vertical; }
+  textarea.short { min-height: 40px; }
   .actions { grid-column: 1 / -1; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
   button { font: inherit; font-weight: 600; border: 0; border-radius: 8px; padding: 9px 18px;
            background: var(--accent); color: var(--accent-ink); cursor: pointer; }
@@ -61,6 +62,18 @@
   .thumb span { display: block; margin-top: 4px; }
   .empty { color: var(--muted); }
   .hint { margin: -4px 0 0; font-size: 13px; color: var(--muted); min-height: 1em; }
+  .viewer { position: fixed; inset: 0; z-index: 10; display: none; align-items: center; justify-content: center;
+            background: rgba(10, 14, 24, .82); padding: 16px; }
+  .viewer.open { display: flex; }
+  .viewer figure { margin: 0; position: relative; background: var(--card); border-radius: 12px; padding: 12px;
+                   max-width: min(92vw, 1048px); box-shadow: 0 20px 60px rgba(0, 0, 0, .4); }
+  .viewer img { display: block; width: min(86vw, 82vh, 1024px); height: auto; aspect-ratio: 1;
+                object-fit: contain; background: #fff; border-radius: 8px; }
+  .viewer figcaption { margin-top: 8px; font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
+  .viewer .close { position: absolute; top: -14px; right: -14px; width: 36px; height: 36px; padding: 0;
+                   border-radius: 999px; font-size: 22px; line-height: 36px; background: var(--card);
+                   color: var(--ink); border: 1px solid var(--line); box-shadow: 0 2px 8px rgba(0, 0, 0, .3); }
+  .thumb { cursor: zoom-in; }
   @media (max-width: 640px) { form { grid-template-columns: 1fr 1fr; } }
 </style>
 </head>
@@ -74,6 +87,9 @@
   <form id="form" class="card">
     <label class="wide">Prompt (at most 77 tokens, about 50 words)
       <textarea id="prompt" required>a shiny red apple with a green leaf, cute cartoon sticker, white background</textarea>
+    </label>
+    <label class="wide">Negative prompt (optional; added to the built-in safety terms, about 17 tokens left with sticker, 45 with none)
+      <textarea id="negative" class="short" placeholder="e.g. green apple, worm"></textarea>
     </label>
     <label>Task ID <input id="taskid" required pattern="[A-Za-z0-9_-]{1,64}"></label>
     <label>Filename prefix <input id="prefix" placeholder="defaults to task ID" pattern="[A-Za-z0-9_-]{1,64}"></label>
@@ -102,6 +118,14 @@
   </div>
   <div class="tasks" id="tasks"></div>
 </main>
+
+<div class="viewer" id="viewer" role="dialog" aria-modal="true" aria-label="Image preview">
+  <figure>
+    <button class="close" id="viewer-close" type="button" aria-label="Close">×</button>
+    <img id="viewer-img" alt="">
+    <figcaption id="viewer-caption"></figcaption>
+  </figure>
+</div>
 
 <script>
 const STORE = "sdg.tasks";
@@ -246,7 +270,11 @@ function render() {
       const grid = el("div", "thumbs");
       for (const img of s.images) {
         const a = el("a", "thumb");
-        a.href = img.url; a.target = "_blank"; a.rel = "noopener";
+        a.href = img.url;
+        a.addEventListener("click", (ev) => {
+          ev.preventDefault();
+          openViewer(img.url, `${t.taskid} · candidate ${s.images.indexOf(img) + 1} · ${img.result.replace("_", " ")} · seed ${img.seed}`);
+        });
         const i = el("img"); i.src = img.url; i.alt = `${t.taskid} candidate`; i.loading = "lazy";
         a.append(i, el("span", null, `${img.result.replace("_", " ")} · seed ${img.seed}`));
         grid.append(a);
@@ -263,6 +291,7 @@ $("form").addEventListener("submit", async (ev) => {
   const task = {
     taskid: $("taskid").value.trim(),
     prompt: $("prompt").value.trim(),
+    negative_prompt: $("negative").value.trim(),
     count: Number($("count").value),
     postprocess: $("postprocess").value,
     on_duplicate: $("dup").value,
@@ -292,6 +321,21 @@ $("form").addEventListener("submit", async (ev) => {
     $("submit").disabled = false;
   }
 });
+
+function openViewer(url, caption) {
+  $("viewer-img").src = url;
+  $("viewer-img").alt = caption;
+  $("viewer-caption").textContent = caption;
+  $("viewer").classList.add("open");
+  $("viewer-close").focus();
+}
+function closeViewer() {
+  $("viewer").classList.remove("open");
+  $("viewer-img").removeAttribute("src");
+}
+$("viewer-close").addEventListener("click", closeViewer);
+$("viewer").addEventListener("click", (ev) => { if (ev.target === $("viewer")) closeViewer(); });
+document.addEventListener("keydown", (ev) => { if (ev.key === "Escape") closeViewer(); });
 
 $("clear").addEventListener("click", () => {
   tasks = []; status = {}; save(); render();

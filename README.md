@@ -6,7 +6,7 @@ An internal image generation service for a kids' dictionary app. The app's backe
 app backend ──HTTP──> gateway ──SSH, rsync──> Explorer: Slurm GPU job (SDXL)
 ```
 
-The gateway runs outside the cluster: it queues tasks in SQLite, batches them into Slurm GPU jobs (up to 200 images, or after 60 s), polls the job every 30 s, and serves the finished images. All connections start at the gateway; the cluster never calls back. [DESIGN.md](DESIGN.md) has the full design.
+The gateway runs outside the cluster: it queues tasks in SQLite, batches them into Slurm GPU jobs (up to 200 images, or after 60 s), polls the job every 30 s, and serves the finished images. A job stays warm for 5 minutes after its batch, so a batch that follows soon skips the queue wait and model start-up. All connections start at the gateway; the cluster never calls back. [DESIGN.md](DESIGN.md) has the full design.
 
 ## API
 
@@ -29,7 +29,7 @@ curl -X POST http://127.0.0.1:8080/api/images/gen -H 'Content-Type: application/
 curl http://127.0.0.1:8080/api/images/tasks/apple-01
 ```
 
-Optional fields: `on_duplicate` (`reject` or `replace`), `postprocess` (`sticker` or `none`), `seed`, and `style`: a LoRA configured as a `[[styles]]` entry in `config.toml` (see `config.example.toml` and DESIGN.md 7.1). `deploy` downloads and checks each style's files.
+Optional fields: `negative_prompt` (added to the built-in safety terms), `on_duplicate` (`reject` or `replace`), `postprocess` (`sticker` or `none`), `seed`, and `style`: a LoRA configured as a `[[styles]]` entry in `config.toml` (see `config.example.toml` and DESIGN.md 7.1). `deploy` downloads and checks each style's files.
 
 ## Running it
 

@@ -16,6 +16,9 @@ env = "dev"                   # "prod" on the server: ~/sd_service/<env>/ and sd
 max_batch_images = 200
 max_wait_s = 60
 max_attempts = 3
+idle_s = 300                  # keep a job warm this long after its batch for the next one; 0 = off
+handoff_timeout_s = 90        # take back a hand-off no warm job claimed, and sbatch instead
+job_minutes = 90              # Slurm time limit: this plus 15 s per image
 
 [poll]
 interval_s = 30

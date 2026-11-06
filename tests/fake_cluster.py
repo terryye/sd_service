@@ -8,7 +8,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from gateway.cluster import ClusterError, PollResult
+from gateway.cluster import ClusterError, PollResult, WarmWorker
 
 
 class FakeBackend:
@@ -25,6 +25,12 @@ class FakeBackend:
         self.ghost = False  # a failing sbatch still creates the job
         self.nameless: dict[str, list[tuple[str, str]]] = {}  # jobs Slurm lost the name of, by job ID
         self.polled_with: list[str | None] = []
+        self.cancelled: list[str] = []
+        self.warm: list[WarmWorker] = []  # workers/<job>.json files
+        self.inbox: dict[str, str] = {}  # inbox/<job> -> batch id
+        self.claimed: set[str] = set()  # out/<batch>/claimed
+        self.finished: set[str] = set()  # out/<batch>/finished
+        self.hand_off_fails = False
 
     def _check(self) -> None:
         if self.down:
@@ -50,11 +56,18 @@ class FakeBackend:
             raise ClusterError("sbatch: error: Batch job submission failed: Unexpected message received")
         return job_id
 
+    def _job(self, job_id: str | None) -> list[tuple[str, str]]:
+        """sacct -j: a job by ID, whatever batch name it was submitted under."""
+        found = [j for jobs in self.jobs.values() for j in jobs if j[0] == job_id]
+        return found or self.nameless.get(job_id, [])
+
     async def poll(self, batch_id: str, job_id: str | None = None) -> PollResult:
         self._check()
         self.polled_with.append(job_id)
-        jobs = sorted(self.jobs.get(batch_id, []) + self.nameless.get(job_id, []), key=lambda j: int(j[0]))
-        return PollResult(jobs, [dict(r) for r in self.progress.get(batch_id, [])])
+        jobs = dict(self.jobs.get(batch_id, []) + self._job(job_id))
+        return PollResult(sorted(jobs.items(), key=lambda j: int(j[0])),
+                          [dict(r) for r in self.progress.get(batch_id, [])],
+                          claimed=batch_id in self.claimed, finished=batch_id in self.finished)
 
     async def fetch(self, batch_id: str, dest: Path) -> None:
         self._check()
@@ -62,10 +75,39 @@ class FakeBackend:
         if src.exists():
             shutil.copytree(src, dest, dirs_exist_ok=True)
 
-    async def cleanup(self, batch_id: str) -> None:
+    async def cleanup(self, batch_id: str, cancel: list[str]) -> None:
         self._check()
         self.cleaned.append(batch_id)
+        self.cancelled += cancel
         shutil.rmtree(self.remote / batch_id, ignore_errors=True)
+
+    async def warm_workers(self) -> list[WarmWorker]:
+        self._check()
+        return list(self.warm)
+
+    async def hand_off(self, job_id: str, batch_id: str) -> None:
+        self._check()
+        if self.hand_off_fails:
+            raise ClusterError("ssh: connection reset")
+        self.inbox[job_id] = batch_id
+
+    async def take_back(self, job_id: str) -> bool:
+        self._check()
+        return self.inbox.pop(job_id, None) is not None
+
+    # ---- what the warm worker would do ----------------------------------------------
+
+    def go_warm(self, job_id: str, idle_until: float, job_end: float) -> None:
+        self.warm = [w for w in self.warm if w.job_id != job_id] + [WarmWorker(job_id, idle_until, job_end, "RUNNING")]
+
+    def claim(self, job_id: str) -> str:
+        batch_id = self.inbox.pop(job_id)
+        self.claimed.add(batch_id)
+        self.warm = [w for w in self.warm if w.job_id != job_id]
+        return batch_id
+
+    def finish(self, batch_id: str) -> None:
+        self.finished.add(batch_id)
 
     # ---- what the Slurm job would do ------------------------------------------------
 

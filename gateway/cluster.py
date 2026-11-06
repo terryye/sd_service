@@ -30,11 +30,23 @@ class ClusterError(Exception):
 class PollResult:
     jobs: list[tuple[str, str]] = field(default_factory=list)  # (job id, state), lowest id first
     progress: list[dict] = field(default_factory=list)  # parsed progress.jsonl lines
+    claimed: bool = False  # a warm worker took over this handed-off batch
+    finished: bool = False  # the worker has written every task's progress line
 
     @property
     def worker(self) -> tuple[str, str] | None:
         """The job that does the work: the lowest job ID with the batch's name."""
         return self.jobs[0] if self.jobs else None
+
+
+@dataclass
+class WarmWorker:
+    """A job that finished its batch and is waiting for another (DESIGN.md 6.5)."""
+
+    job_id: str
+    idle_until: float  # Unix seconds; the worker exits then unless handed a batch
+    job_end: float  # Slurm's end time for the job
+    state: str  # from sacct; only RUNNING workers are handed work
 
 
 class ClusterBackend(Protocol):
@@ -43,16 +55,20 @@ class ClusterBackend(Protocol):
     async def submit(self, batch_id: str, n_images: int) -> str: ...
     async def poll(self, batch_id: str, job_id: str | None = None) -> PollResult: ...
     async def fetch(self, batch_id: str, dest: Path) -> None: ...
-    async def cleanup(self, batch_id: str) -> None: ...
+    async def cleanup(self, batch_id: str, cancel: list[str]) -> None: ...
+    async def warm_workers(self) -> list[WarmWorker]: ...
+    async def hand_off(self, job_id: str, batch_id: str) -> None: ...
+    async def take_back(self, job_id: str) -> bool: ...
 
 
-def time_limit_minutes(n_images: int) -> int:
-    """30 minutes plus 15 seconds per image, capped at the gpu partition's 8 hours.
+def time_limit_minutes(n_images: int, base_minutes: int = 90) -> int:
+    """A fixed part plus 15 seconds per image, capped at the gpu partition's 8 hours.
 
     Start-up (container, packages, model) has taken from under 2 to over 11 minutes,
-    depending on the node, so the fixed part leaves wide room for a slow node.
+    depending on the node, and a warm job may serve further batches, so the fixed
+    part is generous. Fair share is charged for time used, not the limit.
     """
-    return min(480, 30 + math.ceil(n_images * 15 / 60))
+    return min(480, base_minutes + math.ceil(n_images * 15 / 60))
 
 
 def parse_sacct(text: str) -> list[tuple[str, str]]:
@@ -77,6 +93,8 @@ def parse_progress(text: str) -> list[dict]:
 
 
 _SPLIT = "---sdg-progress---"
+_CLAIMED = "---sdg-claimed---"
+_FINISHED = "---sdg-finished---"
 
 
 class SlurmBackend:
@@ -129,7 +147,8 @@ class SlurmBackend:
         name = shlex.quote(batch_id)
         out = await self._login(
             f"cd {self._path()} && sbatch --parsable --job-name={name} --dependency=singleton"
-            f" --time={time_limit_minutes(n_images)} sd_job.sh {name}"
+            f" --time={time_limit_minutes(n_images, self.c.job_minutes)}"
+            f" --export=ALL,SDG_IDLE_S={int(self.c.idle_s)} sd_job.sh {name}"
         )
         job_id = out.strip().split(";")[0]
         if not job_id.isdigit():
@@ -145,12 +164,44 @@ class SlurmBackend:
         name = shlex.quote(batch_id)
         user = shlex.quote(self.c.user)
         by_id = f" sacct -n -X -P -j {shlex.quote(job_id)} -o JobID,State;" if job_id else ""
-        out = await self._login(
+        out = self._path("out", batch_id)
+        text = await self._login(
             f"sacct -n -X -P -u {user} -S now-7days --name={name} -o JobID,State;{by_id}"
-            f" echo {_SPLIT}; cat {self._path('out', batch_id, 'progress.jsonl')} 2>/dev/null || true"
+            f" test -f {out}/claimed && echo {_CLAIMED}; test -f {out}/finished && echo {_FINISHED};"
+            f" echo {_SPLIT}; cat {out}/progress.jsonl 2>/dev/null || true"
         )
-        jobs_text, _, progress_text = out.partition(_SPLIT)
-        return PollResult(parse_sacct(jobs_text), parse_progress(progress_text))
+        head, _, progress_text = text.partition(_SPLIT)
+        return PollResult(parse_sacct(head), parse_progress(progress_text),
+                          claimed=_CLAIMED in head, finished=_FINISHED in head)
+
+    async def warm_workers(self) -> list[WarmWorker]:
+        workers = self._path("workers")
+        text = await self._login(
+            f"for f in {workers}/*.json; do [ -f \"$f\" ] && cat \"$f\" && echo; done; echo {_SPLIT};"
+            f" ids=$(ls {workers} 2>/dev/null | sed -n 's/\\.json$//p' | paste -sd, -);"
+            f' [ -n "$ids" ] && sacct -n -X -P -j "$ids" -o JobID,State || true'
+        )
+        files, _, states_text = text.partition(_SPLIT)
+        states = dict(parse_sacct(states_text))
+        found = []
+        for line in files.splitlines():
+            try:
+                w = json.loads(line)
+                found.append(WarmWorker(str(w["job_id"]), float(w["idle_until"]), float(w["job_end"]),
+                                        states.get(str(w["job_id"]), "UNKNOWN")))
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                continue  # a file being rewritten; seen again next time
+        return found
+
+    async def hand_off(self, job_id: str, batch_id: str) -> None:
+        inbox = self._path("inbox")
+        box = self._path("inbox", job_id)
+        await self._xfer(f"mkdir -p {inbox} && printf %s {shlex.quote(batch_id)} > {box}.tmp && mv {box}.tmp {box}")
+
+    async def take_back(self, job_id: str) -> bool:
+        """Remove an unclaimed hand-off. False if the worker claimed it first (it renames the file)."""
+        out = await self._xfer(f"rm {self._path('inbox', job_id)} 2>/dev/null && echo taken || echo claimed")
+        return out.strip() == "taken"
 
     async def fetch(self, batch_id: str, dest: Path) -> None:
         dest.mkdir(parents=True, exist_ok=True)
@@ -158,7 +209,11 @@ class SlurmBackend:
         ssh = " ".join(shlex.quote(a) for a in self._ssh_args(self.c.xfer_host)[:-1])
         await self._run(["rsync", "-a", "--partial", "-e", ssh, src, f"{dest}/"], timeout=900)
 
-    async def cleanup(self, batch_id: str) -> None:
-        # Cancel duplicate submissions that may still be queued under the batch's name.
-        await self._login(f"scancel -u {shlex.quote(self.c.user)} -n {shlex.quote(batch_id)} || true")
+    async def cleanup(self, batch_id: str, cancel: list[str]) -> None:
+        """Remove the batch's files; cancel duplicate submissions by ID.
+
+        Never by name: the job that ran the batch may still be running, warm.
+        """
+        if cancel:
+            await self._login(f"scancel {' '.join(shlex.quote(j) for j in cancel)} || true")
         await self._xfer(f"rm -rf {self._path('batches', batch_id)} {self._path('out', batch_id)}")

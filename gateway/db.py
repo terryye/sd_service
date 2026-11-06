@@ -16,6 +16,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
     taskid          TEXT PRIMARY KEY,
     prompt          TEXT NOT NULL,
+    negative_prompt TEXT NOT NULL DEFAULT '',  -- the client's own; built-in terms are added at batch time
     filename_prefix TEXT NOT NULL,
     count           INTEGER NOT NULL,
     postprocess     TEXT NOT NULL,
@@ -41,7 +42,8 @@ CREATE TABLE IF NOT EXISTS batches (
     tasks        TEXT NOT NULL,         -- JSON list of taskids
     created      REAL NOT NULL,
     submit_tried REAL,                  -- last upload + sbatch attempt
-    finished     REAL
+    finished     REAL,
+    handoff_at   REAL                   -- set while the batch is handed to a warm job, not sbatch'd
 );
 """
 
@@ -52,6 +54,7 @@ DONE = ("success", "needs_review", "failed")
 class Task:
     taskid: str
     prompt: str
+    negative_prompt: str
     filename_prefix: str
     count: int
     postprocess: str
@@ -83,6 +86,7 @@ class Batch:
     created: float
     submit_tried: float | None
     finished: float | None
+    handoff_at: float | None = None
 
 
 def _task(row: sqlite3.Row) -> Task:
@@ -108,9 +112,14 @@ class Database:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=FULL")
         self.conn.executescript(SCHEMA)
+        # Columns added after the first release; older databases get them here.
         columns = {r["name"] for r in self.conn.execute("PRAGMA table_info(tasks)")}
-        if "style" not in columns:  # databases created before styles existed
-            self.conn.execute("ALTER TABLE tasks ADD COLUMN style TEXT")
+        added = (("style", "style TEXT"), ("negative_prompt", "negative_prompt TEXT NOT NULL DEFAULT ''"))
+        for column, ddl in added:
+            if column not in columns:
+                self.conn.execute(f"ALTER TABLE tasks ADD COLUMN {ddl}")
+        if "handoff_at" not in {r["name"] for r in self.conn.execute("PRAGMA table_info(batches)")}:
+            self.conn.execute("ALTER TABLE batches ADD COLUMN handoff_at REAL")
 
     def close(self) -> None:
         self.conn.close()
@@ -143,10 +152,10 @@ class Database:
             old = self.get_task(task["taskid"])
             if old is None:
                 self.conn.execute(
-                    "INSERT INTO tasks (taskid, prompt, filename_prefix, count, postprocess, seed, style,"
-                    " version, result, images, error, attempts, batch_id, created, updated, queued_at)"
-                    " VALUES (:taskid, :prompt, :filename_prefix, :count, :postprocess, :seed, :style,"
-                    " 1, 'queued', '[]', NULL, 0, NULL, :now, :now, :now)",
+                    "INSERT INTO tasks (taskid, prompt, negative_prompt, filename_prefix, count, postprocess, seed,"
+                    " style, version, result, images, error, attempts, batch_id, created, updated, queued_at)"
+                    " VALUES (:taskid, :prompt, :negative_prompt, :filename_prefix, :count, :postprocess, :seed,"
+                    " :style, 1, 'queued', '[]', NULL, 0, NULL, :now, :now, :now)",
                     {**task, "now": now},
                 )
                 return {"taskid": task["taskid"], "result": "queued", "version": 1}, None
@@ -158,7 +167,8 @@ class Database:
             # A queued task keeps its place in the queue; a finished one starts over.
             queued_at = old.queued_at if old.result == "queued" else now
             self.conn.execute(
-                "UPDATE tasks SET prompt = :prompt, filename_prefix = :filename_prefix, count = :count,"
+                "UPDATE tasks SET prompt = :prompt, negative_prompt = :negative_prompt,"
+                " filename_prefix = :filename_prefix, count = :count,"
                 " postprocess = :postprocess, seed = :seed, style = :style, version = :version, result = 'queued',"
                 " images = '[]', error = NULL, attempts = 0, batch_id = NULL, updated = :now,"
                 " queued_at = :queued_at WHERE taskid = :taskid",
@@ -235,6 +245,20 @@ class Database:
     def mark_submitted(self, batch_id: str, job_id: str) -> None:
         self.conn.execute(
             "UPDATE batches SET state = 'submitted', job_id = ? WHERE batch_id = ?", (job_id, batch_id)
+        )
+
+    def mark_handed_off(self, batch_id: str, job_id: str) -> None:
+        self.conn.execute(
+            "UPDATE batches SET state = 'submitted', job_id = ?, handoff_at = ? WHERE batch_id = ?",
+            (job_id, self.clock(), batch_id),
+        )
+
+    def reset_to_submitting(self, batch_id: str) -> None:
+        """A hand-off nobody claimed: back to the sbatch path, as if never submitted."""
+        self.conn.execute(
+            "UPDATE batches SET state = 'submitting', job_id = NULL, job_state = NULL, handoff_at = NULL,"
+            " submit_tried = NULL WHERE batch_id = ?",
+            (batch_id,),
         )
 
     def set_job_state(self, batch_id: str, job_id: str, job_state: str) -> None:

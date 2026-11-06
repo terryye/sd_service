@@ -25,8 +25,22 @@ from .db import Batch, Database, Task
 log = logging.getLogger("gateway")
 
 NAME = re.compile(r"[A-Za-z0-9_-]{1,64}")
-FIELDS = {"taskid", "prompt", "filename_prefix", "count", "on_duplicate", "postprocess", "seed", "style"}
+FIELDS = {"taskid", "prompt", "negative_prompt", "filename_prefix", "count", "on_duplicate", "postprocess",
+          "seed", "style"}
 IMAGE_SIZE = (1024, 1024)
+
+# Always in the negative prompt: keeps every image suitable for young children (32 tokens).
+SAFETY_NEGATIVE = ("scary, creepy, violent, blood, weapon, nsfw, nude, dark, deformed, extra limbs, "
+                   "text, letters, watermark, signature")
+# Added for "sticker" tasks: pushes SDXL toward one object on a plain background (60 tokens with the above).
+STICKER_NEGATIVE = ("pattern, repeating, seamless, wallpaper, collage, many objects, duplicate, "
+                    "colored background, scenery, photo, photorealistic, blurry")
+
+
+def full_negative(postprocess: str, extra: str) -> str:
+    """The negative prompt the model reads: built-in terms first, then the client's own."""
+    parts = [SAFETY_NEGATIVE] + ([STICKER_NEGATIVE] if postprocess == "sticker" else []) + ([extra] if extra else [])
+    return ", ".join(parts)
 
 
 def iso(t: float | None) -> str | None:
@@ -47,6 +61,7 @@ class Service:
         # Cluster reachability, for /api/health only; not worth persisting.
         self.last_ok: float | None = None
         self.failing_since: float | None = None
+        self.warm: list = []  # warm workers seen by the last idle heartbeat
 
     # ---- submit -----------------------------------------------------------------
 
@@ -89,7 +104,17 @@ class Service:
         tokens = self.count_tokens(full)
         if tokens > self.c.max_prompt_tokens:
             return None, "reject", f"prompt too long: {tokens} tokens, at most {self.c.max_prompt_tokens}"
-        task = {"taskid": taskid, "prompt": prompt.strip(), "filename_prefix": prefix,
+        negative = raw.get("negative_prompt", "")
+        if not isinstance(negative, str):
+            return None, "reject", "negative_prompt must be a string"
+        negative = negative.strip()
+        # SDXL reads at most 77 tokens of the negative prompt too, built-in terms included.
+        neg_tokens = self.count_tokens(full_negative(postprocess, negative))
+        if neg_tokens > self.c.max_prompt_tokens:
+            room = self.c.max_prompt_tokens - self.count_tokens(full_negative(postprocess, ""))
+            return None, "reject", (f"negative_prompt too long: {neg_tokens} tokens with the built-in terms, "
+                                    f"at most {self.c.max_prompt_tokens} (about {room} left for yours)")
+        task = {"taskid": taskid, "prompt": prompt.strip(), "negative_prompt": negative, "filename_prefix": prefix,
                 "count": count, "postprocess": postprocess, "seed": seed, "style": style}
         return task, on_duplicate, None
 
@@ -116,6 +141,8 @@ class Service:
                             "seed": i["seed"], "result": i["result"]} for i in task.images]}
         if task.style:
             view["style"] = task.style
+        if task.negative_prompt:
+            view["negative_prompt"] = task.negative_prompt
         if task.error:
             view["error"] = task.error
         return view
@@ -133,7 +160,9 @@ class Service:
         return {"status": "degraded" if degraded else "ok", "cluster": cluster,
                 "last_poll": iso(self.last_ok), **self.db.queue_stats(),
                 "batches_in_flight": len(self.db.in_flight()),
-                "disk_free_gb": round(disk_free, 1), "styles": sorted(self.c.styles)}
+                "disk_free_gb": round(disk_free, 1), "styles": sorted(self.c.styles),
+                "warm_workers": [{"job_id": w.job_id, "idle_left_s": round(w.idle_until - now)}
+                                 for w in self.warm if w.state == "RUNNING" and w.idle_until > now]}
 
     # ---- batcher ------------------------------------------------------------------
 
@@ -146,8 +175,13 @@ class Service:
             if not queued:
                 return None
             total = sum(t.count for t in queued)
-            waited = self.clock() - min(t.queued_at for t in queued)
-            if total < self.c.max_batch_images and waited < self.c.max_wait_s:
+            now = self.clock()
+            waited = now - min(t.queued_at for t in queued)
+            # Waiting gathers tasks to share one cold start. With a job already warm there is
+            # no start-up to share, so send almost at once.
+            warm = self.c.idle_s > 0 and any(w.state == "RUNNING" and w.idle_until - now >= 15 for w in self.warm)
+            max_wait = self.c.warm_wait_s if warm else self.c.max_wait_s
+            if total < self.c.max_batch_images and waited < max_wait:
                 return None
             chosen, images = [], 0
             for t in queued:  # first in, first out; a task is never split
@@ -164,8 +198,40 @@ class Service:
                 return None
             batch = self.db.claim_batch(self.c.batch_prefix, chosen)
             log.info("batch %s: %d tasks, %d images", batch.batch_id, len(chosen), images)
-            await self._try_submit(batch)
+            if not (self.c.idle_s > 0 and await self._try_hand_off(batch, images)):
+                await self._try_submit(batch)
             return self.db.get_batch(batch.batch_id)
+
+    async def _try_hand_off(self, batch: Batch, images: int) -> bool:
+        """Give the batch to a warm job instead of sbatch: no queue wait, no start-up (DESIGN.md 6.5)."""
+        try:
+            workers = await self.backend.warm_workers()
+        except ClusterError:
+            return False
+        self._see_warm(workers)
+        now = self.clock()
+        need = 15 * images + 600  # generation, plus ten minutes to spare before the job's time limit
+        fit = [w for w in workers
+               if w.state == "RUNNING" and w.idle_until - now >= 15 and w.job_end - now >= need]
+        if not fit:
+            if workers:
+                log.info("batch %s: no warm job fits (%d images, need %.0fs left); using sbatch",
+                         batch.batch_id, images, need)
+            return False
+        worker = max(fit, key=lambda w: w.idle_until)
+        try:
+            await self.backend.upload_batch(batch.batch_id, self.batch_payload(batch))
+        except ClusterError:
+            return False
+        try:
+            await self.backend.hand_off(worker.job_id, batch.batch_id)
+        except ClusterError as exc:
+            # The inbox file may or may not exist now; the poller settles it (take back, or wait for a claim).
+            log.warning("batch %s: hand-off to job %s uncertain: %s", batch.batch_id, worker.job_id, exc)
+        self.db.mark_handed_off(batch.batch_id, worker.job_id)
+        self.warm = [w for w in self.warm if w.job_id != worker.job_id]  # busy now
+        log.info("batch %s: handed to warm job %s", batch.batch_id, worker.job_id)
+        return True
 
     def batch_payload(self, batch: Batch) -> dict:
         tasks = self.db.batch_tasks(batch.batch_id)
@@ -177,6 +243,7 @@ class Service:
         return {"batch_id": batch.batch_id, "styles": styles, "tasks": [
             {"taskid": t.taskid, "version": t.version, "count": t.count, "seeds": t.seeds(),
              "prompt": self.c.styles[t.style].full_prompt(t.prompt) if t.style else t.prompt,
+             "negative_prompt": full_negative(t.postprocess, t.negative_prompt),
              "style": t.style, "postprocess": t.postprocess, "filename_prefix": t.filename_prefix}
             for t in tasks]}
 
@@ -204,7 +271,10 @@ class Service:
             batches = self.db.in_flight()
             if not batches:
                 try:
-                    await self.backend.ping()
+                    if self.c.idle_s > 0:
+                        self._see_warm(await self.backend.warm_workers())  # doubles as the ping
+                    else:
+                        await self.backend.ping()
                     self._cluster_ok()
                 except ClusterError:
                     self._cluster_failed()
@@ -229,6 +299,9 @@ class Service:
                 return
             else:
                 return
+        if batch.handoff_at is not None and not result.claimed:
+            await self._settle_hand_off(batch, worker)
+            return
         if worker is None:
             return  # sacct has not listed the job yet
         job_id, state = worker
@@ -240,16 +313,31 @@ class Service:
         if new:
             await self._collect(batch, new, running)
 
-        if state in TERMINAL:
+        # A worker writes "finished" after its last task and may stay warm (RUNNING) afterwards.
+        if result.finished or state in TERMINAL:
+            why = "the batch finished without it" if result.finished else f"job {job_id} ended ({state})"
             for task in self.db.batch_tasks(batch.batch_id):
                 if task.result == "running":
-                    self.db.charge_attempt(task.taskid, batch.batch_id,
-                                           f"job {job_id} ended ({state}) before the task finished",
+                    self.db.charge_attempt(task.taskid, batch.batch_id, f"{why} before the task finished",
                                            self.c.max_attempts)
-            await self.backend.cleanup(batch.batch_id)
+            # Duplicate submissions still queued; never the job that ran the batch, which may be warm.
+            duplicates = [j for j, s in result.jobs if j != job_id and s not in TERMINAL]
+            await self.backend.cleanup(batch.batch_id, duplicates)
             shutil.rmtree(self.c.staging_dir / batch.batch_id, ignore_errors=True)
             self.db.finish_batch(batch.batch_id)
-            log.info("batch %s: done, job %s %s", batch.batch_id, job_id, state)
+            log.info("batch %s: done, job %s %s", batch.batch_id, job_id, "finished" if result.finished else state)
+
+    async def _settle_hand_off(self, batch: Batch, worker: tuple[str, str] | None) -> None:
+        """A handed-off batch no worker has claimed yet. Waiting here never counts as an attempt."""
+        waited = self.clock() - batch.handoff_at
+        ended = worker is not None and worker[1] in TERMINAL
+        if waited < self.c.handoff_timeout_s and not ended:
+            return
+        # take_back() fails if the worker claimed it at this moment (the next poll sees "claimed"),
+        # or if the hand-off never arrived; after twice the timeout, assume the latter.
+        if await self.backend.take_back(batch.job_id) or waited >= 2 * self.c.handoff_timeout_s:
+            self.db.reset_to_submitting(batch.batch_id)
+            log.info("batch %s: job %s did not take it; submitting with sbatch", batch.batch_id, batch.job_id)
 
     async def _collect(self, batch: Batch, records: list[dict], running: dict[str, Task]) -> None:
         """Pull finished tasks' images, check them, and mark the tasks done."""
@@ -287,6 +375,17 @@ class Service:
             shutil.copyfile(src / name, dest / name)
         by_file = {i["file"]: i for i in listed}
         return [{"file": n, "seed": by_file[n]["seed"], "result": by_file[n]["result"]} for n in expected]
+
+    def _see_warm(self, workers: list) -> None:
+        """Remember the warm jobs; log when the set changes, so a missed hand-off can be explained."""
+        now = self.clock()
+        def ids(ws):
+            return sorted(w.job_id for w in ws if w.state == "RUNNING" and w.idle_until > now)
+        if ids(workers) != ids(self.warm):
+            shown = ", ".join(f"{w.job_id} ({w.idle_until - now:.0f}s left)" for w in workers
+                              if w.state == "RUNNING" and w.idle_until > now) or "none"
+            log.info("warm jobs: %s", shown)
+        self.warm = workers
 
     # ---- reachability ---------------------------------------------------------------
 

@@ -51,7 +51,8 @@ This is an internal service. Only the dictionary app's backend calls it, and app
 | Field | Required | Default | Rules |
 |---|---|---|---|
 | `taskid` | yes | - | globally unique; `[A-Za-z0-9_-]`, 1-64 characters |
-| `prompt` | yes | - | at most 77 tokens, SDXL's limit (about 50-60 words; see 7); the kids' safety negative prompt is always added |
+| `prompt` | yes | - | at most 77 tokens, SDXL's limit (about 50-60 words; see 7) |
+| `negative_prompt` | no | empty | added after the built-in negative terms (7), never replacing them; the whole negative prompt must fit in 77 tokens, which leaves about 17 for `sticker` tasks and 45 for `none` |
 | `filename_prefix` | no | the taskid | `[A-Za-z0-9_-]`, 1-64 characters; files are `<prefix>_<n>.webp` |
 | `count` | no | 1 | 1-4 candidate images |
 | `on_duplicate` | no | `reject` | `reject` or `replace` (section 4.2) |
@@ -110,10 +111,11 @@ At most 100 ids per call; more gives a `400`. Entries come back in the order req
 ```json
 {"status": "ok", "cluster": "reachable", "last_poll": "2026-11-05T14:02:30Z",
  "queued_tasks": 12, "queued_images": 40, "oldest_queued_age_s": 45,
- "batches_in_flight": 1, "disk_free_gb": 182.4, "styles": ["icon3d"]}
+ "batches_in_flight": 1, "disk_free_gb": 182.4, "styles": ["vector"],
+ "warm_workers": [{"job_id": "11657408", "idle_left_s": 212}]}
 ```
 
-`styles` lists the configured style names. `status` is `degraded` when the cluster has been unreachable for more than 5 minutes, or when free disk falls below a configured threshold.
+`styles` lists the configured style names. `warm_workers` lists jobs waiting for another batch (6.5). `status` is `degraded` when the cluster has been unreachable for more than 5 minutes, or when free disk falls below a configured threshold.
 
 ### 3.4a Styles
 
@@ -225,7 +227,7 @@ The job writes `out/<batch_id>/<taskid>/v<version>/<prefix>_<n>.webp`. After eac
 
 ### 6.2 Submitting
 
-- **Slurm settings:** `sbatch --job-name=<batch_id> --dependency=singleton`, on the `gpu` partition with 1 GPU. The time limit is 30 minutes plus 15 seconds per image, capped at 8 hours. Start-up alone has taken from under 2 to over 11 minutes depending on the node, and one job with a 10-minute base timed out before generating anything.
+- **Slurm settings:** `sbatch --job-name=<batch_id> --dependency=singleton --export=ALL,SDG_IDLE_S=<idle_s>`, on the `gpu` partition with 1 GPU. The time limit is `job_minutes` (90) plus 15 seconds per image, capped at 8 hours. Start-up alone has taken from under 2 to over 11 minutes depending on the node, one job with a 10-minute base timed out before generating anything, and a warm job (6.5) may serve further batches. Fair share is charged for time used, not for the limit.
 - **Failed submissions:** `sbatch` can report a failure ("Unexpected message received") and still create the job, sometimes minutes later. So the gateway never resubmits blindly:
   - every submission of a batch reuses the same job name;
   - `--dependency=singleton` stops two copies from running at once;
@@ -246,6 +248,7 @@ sacct -n -X -P -u <user> -S now-7days --name=<batch_id> -o JobID,State ; tail pr
 | SSH fails | retries; `cluster: unreachable` after 5 minutes of failures |
 | `PENDING` | nothing; tasks stay `running` (handed to the cluster) |
 | `RUNNING`, new progress lines | pulls the finished tasks' images, marks those tasks done |
+| `out/<batch>/finished` exists | the batch is done, though its job may still be RUNNING (warm, 6.5); any task missing from progress is requeued |
 | `COMPLETED` | pulls the remaining images; any task missing from progress is requeued |
 | `FAILED` / `TIMEOUT` / `NODE_FAIL` / `CANCELLED` | unfinished tasks are requeued |
 
@@ -255,7 +258,17 @@ sacct -n -X -P -u <user> -S now-7days --name=<batch_id> -o JobID,State ; tail pr
 - **A batch that ends while unfinished tasks remain:** each unfinished task goes back to `queued` with `attempts + 1`, or becomes `failed` when `attempts` reaches 3.
 - **A hung job** is ended by its Slurm time limit, and is then handled the same way.
 - **Pulling:** rsync from the transfer node, then check each file (it decodes as WebP, 1024×1024), then move it into `data/results/<taskid>/`. Only then is the task marked done.
-- **Cleanup:** once a whole batch has been collected, the gateway deletes `batches/<batch_id>` and `out/<batch_id>` on the cluster. The gateway's disk is the permanent store, and the cluster home quota is 75 GB.
+- **Cleanup:** once a whole batch has been collected, the gateway deletes `batches/<batch_id>` and `out/<batch_id>` on the cluster, and cancels duplicate submissions by job ID. It never cancels by name, which would kill the job that ran the batch while it is warm. The gateway's disk is the permanent store, and the cluster home quota is 75 GB.
+
+### 6.5 Warm workers (idle window)
+
+Start-up (container, packages, loading SDXL) costs from under a minute to several minutes per job, plus the Slurm queue wait. So a job does not exit when its batch is done: it stays warm for `idle_s` (300 s) in case another batch comes.
+
+- **The worker** writes `out/<batch>/finished`, then announces itself in `workers/<job_id>.json` (`idle_until`, `job_end`) and checks `inbox/<job_id>` every 2 s. It stops waiting early when less than 10 minutes remain before its Slurm time limit, and removes the announcement when it exits.
+- **The batcher**, with a batch ready, reads the announcements and picks a RUNNING worker that is still warm for at least 15 s and has at least 15 s per image plus 10 minutes left before its time limit. It uploads `batch.json` and writes the batch ID into `inbox/<job_id>` (written as a temp file, then renamed). Otherwise it uses `sbatch`.
+- **Claiming:** the worker renames `inbox/<job_id>`, an atomic step, then writes `out/<batch>/claimed` and runs the batch with the model already loaded. The poller tracks the batch by the worker's job ID.
+- **No claim:** after `handoff_timeout_s` (90 s), or as soon as the worker's job ends, the poller deletes the inbox file and sends the batch through `sbatch`. If the file is gone because the worker claimed it at that moment, the next poll sees `claimed`. If the hand-off never arrived (the inbox write failed), the batch goes to `sbatch` after twice the timeout. None of this counts as an attempt.
+- **Limits:** 5 minutes is well under IdleBot's 15-minute warning. A warm job holds a GPU and is charged to the account's fair share while it waits; `idle_s = 0` turns it off.
 
 ### 6.4 Cluster-side environment
 
@@ -276,7 +289,7 @@ sacct -n -X -P -u <user> -S now-7days --name=<batch_id> -o JobID,State ; tail pr
 
 - **Model:** SDXL base 1.0 with the fp16-fix VAE, 30 steps, guidance 6.0, always 1024×1024.
 - **Prompt length:** SDXL's text encoders read at most 77 tokens and silently ignore the rest. The gateway counts tokens at submit time with SDXL's CLIP tokenizer and rejects longer prompts with `prompt too long`, so a prompt is never cut off without the client knowing.
-- **Negative prompt:** the kids' safety negative prompt is always added to the client's prompt.
+- **Negative prompt:** the gateway builds it: the kids' safety terms (32 tokens) always, the sticker terms for `sticker` tasks (60 tokens together), then the task's own `negative_prompt`. It must fit in SDXL's 77 tokens; a longer one is rejected with the room that was left.
 - **`postprocess: sticker`:**
   - whiten the background: the edge-connected flat background, holes that match it, stray specks, and the light grey haze of a soft shadow around the sticker;
   - check for a repeating pattern or an object cut off by the image edge, and if found, retry with the next seed, up to 4 tries;
@@ -327,6 +340,7 @@ One file, `config.toml`, so the same code runs on a laptop and on the server:
             xfer_host = "xfer.discovery.neu.edu"   ssh_key = "~/.ssh/sd_gateway"   remote_dir = "~/sd_service"
             env = "dev"   # "prod" on the server; picks ~/sd_service/<env>/ and the sdg-<env>- prefix
 [queue]     max_batch_images = 200   max_wait_s = 60   max_attempts = 3
+            idle_s = 300   handoff_timeout_s = 90   job_minutes = 90
 [poll]      interval_s = 30   unreachable_after_s = 300
 [limits]    max_tasks_per_request = 100   max_ids_per_status = 100   min_disk_free_gb = 10
 [downloads] civitai_token = ""          # deploy only

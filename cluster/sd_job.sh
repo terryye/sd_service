@@ -1,8 +1,10 @@
 #!/bin/bash
 # Slurm job for one gateway batch (DESIGN.md 6). The gateway submits it from the
 # environment's directory, ~/sd_service/<env>/:
-#   sbatch --job-name=<batch_id> --dependency=singleton --time=... sd_job.sh <batch_id>
-# Reads batches/<batch_id>/batch.json, writes out/<batch_id>/.
+#   sbatch --job-name=<batch_id> --dependency=singleton --time=... \
+#          --export=ALL,SDG_IDLE_S=<seconds> sd_job.sh <batch_id>
+# Reads batches/<batch_id>/batch.json, writes out/<batch_id>/. Afterwards the worker
+# stays warm for SDG_IDLE_S seconds in case the gateway hands it another batch.
 
 #SBATCH --partition=gpu
 #SBATCH --nodes=1
@@ -50,7 +52,10 @@ run pip install -q --disable-pip-version-check --no-deps --target "$TMP/pylib" \
 run python -c "import scipy" 2>/dev/null ||
     run pip install -q --disable-pip-version-check --no-deps --target "$TMP/pylib" "scipy==1.18.1"
 
+# When Slurm will end this job: the worker stops waiting for work well before then.
+JOB_END=$(date -d "$(squeue -h -j "$SLURM_JOB_ID" -o %e)" +%s 2>/dev/null || echo 0)
+
 stamp "packages installed, starting generate.py"
-run python "$ENV_DIR/generate.py" --batch "$ENV_DIR/batches/$BATCH/batch.json" --out "$ENV_DIR/out/$BATCH" \
-    --loras "$ROOT/loras"
+run python "$ENV_DIR/generate.py" --env "$ENV_DIR" --batch-id "$BATCH" --loras "$ROOT/loras" \
+    --job-id "$SLURM_JOB_ID" --job-end "$JOB_END" --idle-s "${SDG_IDLE_S:-0}"
 stamp "finished $(date)"

@@ -32,8 +32,9 @@ def test_parse_progress_skips_a_half_written_line():
 
 
 def test_time_limit():
-    assert time_limit_minutes(4) == 31
-    assert time_limit_minutes(200) == 80
+    assert time_limit_minutes(4) == 91
+    assert time_limit_minutes(200) == 140
+    assert time_limit_minutes(4, base_minutes=30) == 31
     assert time_limit_minutes(10_000) == 480
 
 
@@ -46,7 +47,10 @@ def test_commands_stay_inside_the_environment(env):
     assert run(backend.submit(batch_id, 8)) == "4242"
     run(backend.poll(batch_id))
     run(backend.fetch(batch_id, Path("/tmp/sdg-test-fetch")))
-    run(backend.cleanup(batch_id))
+    run(backend.cleanup(batch_id, []))
+    run(backend.warm_workers())
+    run(backend.hand_off("4242", batch_id))
+    run(backend.take_back("4242"))
     other = "prod" if env == "dev" else "dev"
     for args in calls:
         joined = " ".join(args)
@@ -56,6 +60,7 @@ def test_commands_stay_inside_the_environment(env):
     submit = calls[1][-1]
     assert f"--job-name=sdg-{env}-000007" in submit and "--dependency=singleton" in submit
     assert submit.startswith(f"cd sd_service/{env} && sbatch")
+    assert "--export=ALL,SDG_IDLE_S=300" in submit and "--time=92 " in submit
 
 
 def test_config_file(tmp_path):
@@ -69,3 +74,12 @@ def test_config_file(tmp_path):
         load(path)
     with pytest.raises(ValueError, match="env must be"):
         Config(env="../prod")
+
+
+def test_cleanup_cancels_duplicates_by_id_never_by_name():
+    backend, calls = recording(Config(user="ye.te", env="dev"))
+    run(backend.cleanup("sdg-dev-000001", ["555", "556"]))
+    scancel = calls[0][-1]
+    assert scancel.startswith("scancel 555 556") and "-n" not in scancel
+    run(backend.cleanup("sdg-dev-000002", []))
+    assert not any("scancel" in c[-1] for c in calls[1:])

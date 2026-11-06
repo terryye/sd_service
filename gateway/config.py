@@ -84,6 +84,10 @@ class Config:
     max_wait_s: float = 60
     max_attempts: int = 3
     batcher_interval_s: float = 5
+    idle_s: float = 300  # how long a job stays warm after its batch; 0 = exit at once
+    handoff_timeout_s: float = 90  # take back a hand-off no worker claimed by then
+    warm_wait_s: float = 5  # max_wait_s while a job is warm: no cold start to gather tasks for
+    job_minutes: int = 90  # Slurm time limit: this plus 15 s per image of the first batch
     # [poll]
     poll_interval_s: float = 30
     unreachable_after_s: float = 300
@@ -133,7 +137,8 @@ class Config:
 _SECTIONS = {
     "server": {"listen", "data_dir"},
     "cluster": {"user", "login_host", "xfer_host", "ssh_key", "remote_dir", "env"},
-    "queue": {"max_batch_images", "max_wait_s", "max_attempts", "batcher_interval_s"},
+    "queue": {"max_batch_images", "max_wait_s", "max_attempts", "batcher_interval_s", "idle_s", "handoff_timeout_s",
+              "job_minutes", "warm_wait_s"},
     "poll": {"interval_s", "unreachable_after_s", "resubmit_after_s"},
     "limits": {"max_tasks_per_request", "max_ids_per_status", "min_disk_free_gb", "max_prompt_tokens"},
     "downloads": {"civitai_token"},

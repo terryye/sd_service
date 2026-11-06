@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -89,7 +90,7 @@ def generate(monkeypatch):
     torch.Generator = Gen
     diffusers = types.ModuleType("diffusers")
     diffusers.AutoencoderKL = types.SimpleNamespace(from_pretrained=lambda *a, **k: object())
-    diffusers.StableDiffusionXLPipeline = types.SimpleNamespace(from_pretrained=lambda *a, **k: Pipe())
+    diffusers.StableDiffusionXLPipeline = types.SimpleNamespace(from_pretrained=lambda *a, **k: Pipe(), _pipe=Pipe)
     safetensors_torch = types.ModuleType("safetensors.torch")
     safetensors_torch.load_file = lambda path: (
         {"clip_l": "L", "clip_g": "G"} if path.endswith(".emb.safetensors")
@@ -106,18 +107,30 @@ def generate(monkeypatch):
     sys.modules.pop("generate", None)
 
 
-def run_batch(generate, tmp_path, monkeypatch, tasks, styles=None):
-    batch = tmp_path / "batch.json"
-    batch.write_text(json.dumps({"batch_id": "sdg-test-000001", "styles": styles or {}, "tasks": tasks}))
-    out = tmp_path / "out"
-    monkeypatch.setattr(sys, "argv", ["generate.py", "--batch", str(batch), "--out", str(out),
-                                      "--loras", str(tmp_path / "loras")])
+def write_batch(env: Path, batch_id: str, tasks, styles=None) -> None:
+    (env / "batches" / batch_id).mkdir(parents=True, exist_ok=True)
+    (env / "batches" / batch_id / "batch.json").write_text(
+        json.dumps({"batch_id": batch_id, "styles": styles or {}, "tasks": tasks}))
+
+
+def progress_of(env: Path, batch_id: str) -> list[dict]:
+    return [json.loads(line) for line in (env / "out" / batch_id / "progress.jsonl").read_text().splitlines()]
+
+
+def run_job(generate, tmp_path, monkeypatch, batch_id, *extra):
+    monkeypatch.setattr(sys, "argv", ["generate.py", "--env", str(tmp_path / "env"), "--batch-id", batch_id,
+                                      "--loras", str(tmp_path / "loras"), *extra])
     assert generate.main() == 0
-    lines = (out / "progress.jsonl").read_text().splitlines()
-    return out, [json.loads(line) for line in lines]
 
 
-TASK = {"taskid": "apple", "version": 2, "prompt": "a red apple", "count": 2,
+def run_batch(generate, tmp_path, monkeypatch, tasks, styles=None):
+    env = tmp_path / "env"
+    write_batch(env, "sdg-test-000001", tasks, styles)
+    run_job(generate, tmp_path, monkeypatch, "sdg-test-000001")
+    return env / "out" / "sdg-test-000001", progress_of(env, "sdg-test-000001")
+
+
+TASK = {"taskid": "apple", "version": 2, "prompt": "a red apple", "negative_prompt": "scary", "count": 2,
         "seeds": [11, 12], "postprocess": "sticker", "filename_prefix": "app"}
 
 
@@ -146,9 +159,11 @@ def test_pattern_is_retried_with_a_new_seed(generate, tmp_path, monkeypatch):
 
 def test_pattern_on_every_try_needs_review(generate, tmp_path, monkeypatch):
     generate.bad_seeds.update({12} | {generate.retry_seed(12, a) for a in range(1, 4)})
-    _, progress = run_batch(generate, tmp_path, monkeypatch, [TASK])
+    out, progress = run_batch(generate, tmp_path, monkeypatch, [TASK])
     assert progress[0]["images"][1]["result"] == "needs_review"
     assert progress[0]["images"][1]["attempts"] == 4
+    with Image.open(out / "apple" / "v2" / "app_2.webp") as im:
+        assert im.convert("RGB").getpixel((5, 5)) != (255, 255, 255)  # kept as drawn, not whitened
 
 
 def test_rerun_skips_finished_tasks(generate, tmp_path, monkeypatch):
@@ -175,11 +190,11 @@ def test_styles_load_once_and_switch_per_task(generate, tmp_path, monkeypatch, c
              {**TASK, "taskid": "plain", "count": 1, "seeds": [2], "style": None}]
     run_batch(generate, tmp_path, monkeypatch, tasks, styles)
     assert generate.lora == [
-        ("load", ["text_encoder.layer.lora.weight", "unet.down.lora.weight"], "icon3d"),  # prefix fixed
+        ("load", ["text_encoder.layer.lora.weight", "unet.down.lora.weight"], "icon3d-aaa"),  # prefix fixed
         ("embed", "L", ("<s0>", "<s1>"), "clip_l side"),
         ("embed", "G", ("<s0>", "<s1>"), "clip_g side"),
-        ("enable",), ("set", ("icon3d",), (0.9,)),   # task "styled"
-        ("disable",),                                # task "plain"
+        ("enable",), ("set", ("icon3d-aaa",), (0.9,)),   # task "styled"; adapters are named after the file
+        ("disable",),                                    # task "plain"
     ]
     assert "style icon3d loaded" in capsys.readouterr().out
 
@@ -203,3 +218,37 @@ def test_a_style_that_fails_to_load_fails_only_its_tasks(generate, tmp_path, mon
 def test_fix_prefixes(generate):
     fixed = generate.fix_prefixes({"unet.unet.a": 1, "unet.b": 2, "text_encoder_2.text_encoder_2.c": 3})
     assert fixed == {"unet.a": 1, "unet.b": 2, "text_encoder_2.c": 3}
+
+
+def test_batch_ends_with_a_finished_marker(generate, tmp_path, monkeypatch):
+    out, _ = run_batch(generate, tmp_path, monkeypatch, [TASK])
+    assert (out / "finished").exists()
+
+
+def test_warm_worker_runs_a_handed_off_batch_without_reloading(generate, tmp_path, monkeypatch):
+    env = tmp_path / "env"
+    write_batch(env, "b1", [{**TASK, "taskid": "first"}])
+    write_batch(env, "b2", [{**TASK, "taskid": "second"}])
+    (env / "inbox").mkdir(parents=True)
+    (env / "inbox" / "77").write_text("b2")  # the gateway's hand-off, waiting when b1 ends
+    loads = []
+    monkeypatch.setattr(generate.StableDiffusionXLPipeline, "from_pretrained",
+                        lambda *a, **k: loads.append(1) or generate.StableDiffusionXLPipeline._pipe())
+    # Short idle window, far-off job end: b2 is claimed at once, then the window closes.
+    run_job(generate, tmp_path, monkeypatch, "b1", "--job-id", "77", "--job-end", str(time.time() + 7200),
+            "--idle-s", "1")
+    assert len(loads) == 1  # the model loaded once for both batches
+    assert [r["taskid"] for r in progress_of(env, "b2")] == ["second"]
+    assert (env / "out" / "b2" / "claimed").exists() and (env / "out" / "b2" / "finished").exists()
+    assert not (env / "inbox" / "77").exists() and not (env / "inbox" / "77.claimed").exists()
+    assert list((env / "workers").iterdir()) == []  # the announcement is gone once it exits
+
+
+def test_no_idle_window_near_the_job_time_limit(generate, tmp_path, monkeypatch):
+    env = tmp_path / "env"
+    write_batch(env, "b1", [TASK])
+    (env / "inbox").mkdir(parents=True)
+    (env / "inbox" / "77").write_text("b2")
+    run_job(generate, tmp_path, monkeypatch, "b1", "--job-id", "77", "--job-end", str(time.time() + 300),
+            "--idle-s", "300")
+    assert (env / "inbox" / "77").exists()  # never claimed: less than 10 minutes were left
